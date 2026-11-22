@@ -14,12 +14,13 @@ from urllib.parse import urlencode
 import requests
 from cryptography.fernet import Fernet
 from flask import Flask, Response, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv('DATABASE_PATH', os.path.join(ROOT, 'dashboard.sqlite3'))
 app = Flask(__name__)
 app.secret_key = os.getenv('APP_SECRET') or secrets.token_urlsafe(48)
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1', MAX_CONTENT_LENGTH=8 * 1024 * 1024)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12), MAX_CONTENT_LENGTH=8 * 1024 * 1024)
 CENT = Decimal('0.01')
 SCOPES = [
     'https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly',
@@ -54,6 +55,15 @@ def init_db():
         if not c.execute('SELECT 1 FROM schema_migrations WHERE version=2').fetchone():
             with open(os.path.join(ROOT,'migrations','002_stock_rules.sql'),encoding='utf-8') as f:c.executescript(f.read())
             c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=3').fetchone():
+            with open(os.path.join(ROOT,'migrations','003_demo_roles.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=4').fetchone():
+            with open(os.path.join(ROOT,'migrations','004_demo_store_modes.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=5').fetchone():
+            with open(os.path.join(ROOT,'migrations','005_demo_share_history.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)',(now(),))
         # Seed a fresh database once. Never recreate defaults when an owner has
         # renamed or removed their accounts.
         if c.execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 0:
@@ -61,14 +71,103 @@ def init_db():
                 cur = c.execute('INSERT INTO accounts(name,share) VALUES(?,?)', (name, share))
                 c.execute('INSERT INTO share_history(account_id,percent,loss_sharing,effective_at) VALUES(?,?,0,?)', (cur.lastrowid, share, now()))
 
-init_db()
+def seed_demo_data():
+    with db() as c:
+        if c.execute('SELECT COUNT(*) FROM demo_stores').fetchone()[0]:
+            return
+        configs=[('North Star Goods','30','0.38','0.12','dropshipping',3),('Maple & Main','30','0.49','0.14','low_stock',4),('Coastal Finds','30','0.63','0.16','dropshipping',3),('Peak Home','60','0.84','0.18','low_stock',5)]
+        stores=[]
+        for name,share,cost_ratio,fee_ratio,mode,threshold in configs:
+            store_id=c.execute('INSERT INTO demo_stores(name,currency,share,fulfilment_mode,low_stock_threshold) VALUES(?,\'GBP\',?,?,?)',(name,share,mode,threshold)).lastrowid
+            stores.append((store_id,Decimal(cost_ratio),Decimal(fee_ratio)))
+            c.execute('INSERT INTO demo_share_history(store_id,percent,loss_sharing,effective_at) VALUES(?,?,0,?)',(store_id,share,(datetime.now(timezone.utc)-timedelta(days=91)).isoformat()))
+        today=datetime.now(timezone.utc)
+        for store_id,cost_ratio,fee_ratio in stores:
+            for i in range(45):
+                day=today-timedelta(days=(i*2 + store_id) % 90)
+                order_id=f'DEMO-{store_id:02d}-{1001+i:04d}'
+                qty=1+i%2
+                sku=f'SKU-{i%4+1}'
+                proceeds=Decimal(34 + (i*7)%67 + store_id*5).quantize(CENT)
+                refunds=Decimal('8.25') if i%11==0 else Decimal('0.00')
+                fees=(proceeds*fee_ratio).quantize(CENT)
+                tax=(proceeds*Decimal('0.20')).quantize(CENT)
+                source={'lineItems':[{'sku':sku,'quantity':qty,'title':f'Sample item {i%4+1}'}],'demo':True}
+                c.execute('INSERT INTO demo_orders(store_id,order_id,created_at,currency,proceeds,tax,refunds,fees,status,source_json) VALUES(?,?,?,?,?,?,?,?,?,?)',(store_id,order_id,day.isoformat(), 'GBP',str(proceeds),str(tax),str(refunds),str(fees),'PAID',json.dumps(source)))
+                if i%9 != 0:
+                    product=(proceeds*cost_ratio).quantize(CENT)
+                    c.execute('INSERT INTO demo_costs(store_id,order_id,sku,kind,amount,currency,note,created_at) VALUES(?,?,?,?,?,?,?,?)',(store_id,order_id,sku,'product',str(product),'GBP','Synthetic product cost',now()))
+                fulfilment=(Decimal('3.50')+Decimal(qty)*Decimal('1.25')).quantize(CENT)
+                c.execute('INSERT INTO demo_costs(store_id,order_id,sku,kind,amount,currency,note,created_at) VALUES(?,?,?,?,?,?,?,?)',(store_id,order_id,sku,'fulfilment',str(fulfilment),'GBP','Synthetic fulfilment cost',now()))
+
+def seed_demo_users():
+    manager_password=os.getenv('DEMO_MANAGER_PASSWORD','')
+    client_password=os.getenv('DEMO_CLIENT_PASSWORD','')
+    if len(manager_password)<12 or len(client_password)<12:
+        return False
+    with db() as c:
+        stores=[r['id'] for r in c.execute('SELECT id FROM demo_stores ORDER BY id')]
+        if len(stores)<4:
+            raise RuntimeError('Demo stores are not initialized')
+        credentials=[(os.getenv('DEMO_MANAGER_USERNAME','manager@demo.local'),'Demo Manager','manager',manager_password,stores),(os.getenv('DEMO_CLIENT_USERNAME','client@demo.local'),'Demo Client','client',client_password,[stores[0]])]
+        for username,display,role,password,assigned in credentials:
+            c.execute('INSERT INTO users(username,display_name,password_hash,role,active,created_at) VALUES(?,?,?,?,1,?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name,password_hash=excluded.password_hash,role=excluded.role,active=1',(username,display,generate_password_hash(password,method='scrypt'),role,now()))
+            user_id=c.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone()['id']
+            c.execute('DELETE FROM demo_user_stores WHERE user_id=?',(user_id,))
+            c.executemany('INSERT INTO demo_user_stores(user_id,store_id) VALUES(?,?)',[(user_id,sid) for sid in assigned])
+    return True
+
+def current_user():
+    user_id=session.get('user_id')
+    if not user_id:
+        return None
+    with db() as c:
+        row=c.execute('SELECT id,username,display_name,role,active FROM users WHERE id=?',(user_id,)).fetchone()
+    if not row or not row['active']:
+        session.clear()
+        return None
+    return dict(row)
 
 def login_required(fn):
     @wraps(fn)
     def wrapped(*a, **kw):
-        if not session.get('owner'): return jsonify(error='Owner login required'), 401
+        if not current_user():
+            if request.path.startswith('/api/') or request.path.endswith('.csv') or request.path.startswith('/oauth/'):
+                return jsonify(error='Authentication required'),401
+            return redirect(url_for('login'))
         return fn(*a, **kw)
     return wrapped
+
+def manager_required(fn):
+    @wraps(fn)
+    @login_required
+    def wrapped(*a, **kw):
+        if current_user()['role']!='manager':
+            return jsonify(error='Manager role required'),403
+        return fn(*a, **kw)
+    return wrapped
+
+def allowed_store_ids(user_id):
+    with db() as c:
+        return [r['store_id'] for r in c.execute('SELECT store_id FROM demo_user_stores WHERE user_id=? ORDER BY store_id',(user_id,))]
+
+def allowed_store(user, store_id):
+    if store_id not in allowed_store_ids(user['id']):
+        return False
+    return True
+
+def csrf_valid():
+    token=request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
+    return bool(token and secrets.compare_digest(token,session.get('csrf','')))
+
+@app.before_request
+def protect_post_requests():
+    if request.method=='POST' and not csrf_valid():
+        return jsonify(error='Invalid or missing CSRF token'),400
+
+init_db()
+seed_demo_data()
+seed_demo_users()
 def encryption():
     key = os.getenv('TOKEN_ENCRYPTION_KEY')
     return Fernet(key.encode()) if key else None
@@ -82,100 +181,197 @@ def oauth_host(): return 'https://auth.sandbox.ebay.com' if os.getenv('EBAY_ENV'
 
 @app.get('/')
 def home():
-    # Local-only owner convenience: loopback is the access boundary for this private app.
-    session['owner'] = True
-    session.setdefault('csrf', secrets.token_urlsafe(32))
+    if not current_user():
+        return redirect(url_for('login'))
+    session.setdefault('csrf',secrets.token_urlsafe(32))
     return render_template('index.html')
+
+@app.route('/login',methods=['GET','POST'])
+def login():
+    if current_user():
+        return redirect(url_for('home'))
+    session.setdefault('csrf',secrets.token_urlsafe(32))
+    error=None
+    if request.method=='POST':
+        username=request.form.get('username','').strip()
+        password=request.form.get('password','')
+        with db() as c:
+            row=c.execute('SELECT * FROM users WHERE username=? AND active=1',(username,)).fetchone()
+        if row and check_password_hash(row['password_hash'],password):
+            session.clear()
+            session['user_id']=row['id']
+            session['csrf']=secrets.token_urlsafe(32)
+            session.permanent=True
+            return redirect(url_for('home'))
+        error='Username or password is incorrect.'
+    with db() as c:
+        configured=c.execute('SELECT COUNT(*) FROM users WHERE active=1').fetchone()[0]>0
+    return render_template('login.html',csrf=session['csrf'],configured=configured,error=error), (401 if error else 200)
+
+@app.post('/logout')
+@login_required
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+def build_demo_state(user):
+    ids=allowed_store_ids(user['id'])
+    if not ids:
+        return {'user':{'name':user['display_name'],'role':user['role']},'dataset':'SYNTHETIC DEMO','stores':[],'orders':[],'costs':[],'defaults':[],'history':[],'csrf':session.get('csrf')}
+    marks=','.join('?' for _ in ids)
+    with db() as c:
+        stores=[dict(r) for r in c.execute(f'SELECT id,name,currency,share,loss_sharing,fulfilment_mode,low_stock_threshold FROM demo_stores WHERE id IN ({marks}) ORDER BY id',ids)]
+        history=[dict(r) for r in c.execute(f'SELECT store_id AS account_id,percent,effective_at,loss_sharing FROM demo_share_history WHERE store_id IN ({marks}) ORDER BY effective_at,id',ids)]
+        orders=[dict(r) for r in c.execute(f'SELECT id,store_id AS account_id,order_id,created_at,currency,proceeds,tax,refunds,fees,status,source_json FROM demo_orders WHERE store_id IN ({marks}) ORDER BY created_at DESC',ids)]
+        costs=[dict(r) for r in c.execute(f'SELECT id,store_id AS account_id,order_id,sku,kind,amount,currency,note FROM demo_costs WHERE store_id IN ({marks})',ids)]
+    for order in orders:
+        order['source_json']=json.loads(order['source_json'])
+        result=calculate(order,costs,[],stores,history)
+        order['calculation']=result
+        order['demo']=True
+    return {'user':{'name':user['display_name'],'role':user['role']},'dataset':'SYNTHETIC DEMO','stores':stores,'orders':orders,'costs':costs,'defaults':[],'history':[],'csrf':session.get('csrf')}
 
 @app.get('/api/state')
 @login_required
 def state():
-    with db() as c:
-        accounts = [dict(r) for r in c.execute('SELECT id,name,share,loss_sharing,marketplace,connected,sync_at,coverage,error FROM accounts ORDER BY id')]
-        orders = [dict(r) for r in c.execute('SELECT * FROM orders ORDER BY created_at DESC')]
-        costs = [dict(r) for r in c.execute('SELECT * FROM costs')]
-        defaults = [dict(r) for r in c.execute('SELECT * FROM sku_costs')]
-        listings = [dict(r) for r in c.execute('SELECT account_id,sku,offer_id,title,quantity,status FROM listings')]
-        stock_rules = [dict(r) for r in c.execute('SELECT account_id,sku,threshold FROM stock_rules')]
-        metrics = [dict(r) for r in c.execute('SELECT account_id,day,payload FROM metrics')]
-        ledger = [dict(r) for r in c.execute('SELECT account_id,order_id,type,amount,currency FROM ledger')]
-        history = [dict(r) for r in c.execute('SELECT * FROM share_history ORDER BY effective_at')]
-    for o in orders: o['source_json'] = json.loads(o['source_json'])
-    for l in metrics: l['payload'] = json.loads(l['payload'])
-    return jsonify(accounts=accounts,orders=orders,costs=costs,defaults=defaults,listings=listings,stockRules=stock_rules,metrics=metrics,ledger=ledger,history=history,csrf=session.get('csrf'))
+    return jsonify(build_demo_state(current_user()))
 
 @app.post('/api/stock-rules')
-@login_required
+@manager_required
 def set_stock_rule():
-    d=request.get_json(force=True)
+    d=request.get_json(force=True); user=current_user()
+    try:store_id=int(d.get('store_id',d.get('account_id'))); threshold=int(d.get('threshold'))
+    except (TypeError,ValueError):return jsonify(error='Store, SKU and whole-number threshold are required'),400
     sku=str(d.get('sku','')).strip()
-    try: threshold=int(d.get('threshold'))
-    except (TypeError,ValueError): return jsonify(error='Enter a whole-number stock threshold'),400
-    if not sku or len(sku)>100:return jsonify(error='SKU is required (maximum 100 characters)'),400
-    if threshold<0 or threshold>1000000:return jsonify(error='Threshold must be between 0 and 1,000,000'),400
-    try:
-        with db() as c:c.execute('INSERT INTO stock_rules(account_id,sku,threshold,updated_at) VALUES(?,?,?,?) ON CONFLICT(account_id,sku) DO UPDATE SET threshold=excluded.threshold,updated_at=excluded.updated_at',(int(d['account_id']),sku,threshold,now()))
-    except sqlite3.IntegrityError:return jsonify(error='Seller account was not found'),404
+    if not allowed_store(user,store_id):return jsonify(error='Store not found'),404
+    if not sku or len(sku)>120 or threshold<0:return jsonify(error='SKU is required and threshold must be zero or higher'),400
+    with db() as c:c.execute('INSERT INTO demo_stock_rules(store_id,sku,threshold,updated_at) VALUES(?,?,?,?) ON CONFLICT(store_id,sku) DO UPDATE SET threshold=excluded.threshold,updated_at=excluded.updated_at',(store_id,sku,threshold,now()))
     return jsonify(ok=True)
 
-@app.post('/api/accounts/<int:aid>')
-@login_required
+@app.post('/api/stores/<int:aid>')
+@manager_required
 def edit_account(aid):
-    d=request.get_json(force=True); percent=Decimal(str(d.get('share','0')))
-    if not 0 <= percent <= 100: return jsonify(error='Share must be from 0 to 100'),400
+    user=current_user()
+    if not allowed_store(user,aid):return jsonify(error='Store not found'),404
+    d=request.get_json(force=True)
+    name=str(d.get('name','')).strip()
+    if not name or len(name)>80:return jsonify(error='Store name must be 1 to 80 characters'),400
+    mode=d.get('fulfilment_mode','dropshipping')
+    loss_sharing=1 if str(d.get('loss_sharing','0')) in ('1','true','True') else 0
+    try:
+        threshold=int(d.get('low_stock_threshold',3)); share=Decimal(str(d.get('share','0')))
+        effective_date=datetime.fromisoformat(str(d.get('effective_date') or datetime.now(timezone.utc).date().isoformat())).date()
+    except (TypeError,ValueError,InvalidOperation):return jsonify(error='Enter a valid share, effective date, and whole-number threshold'),400
+    if mode not in ('dropshipping','low_stock') or threshold<0 or not share.is_finite() or share<0 or share>100:return jsonify(error='Choose a stock model, threshold of zero or more, and share from 0 to 100'),400
+    effective_at=effective_date.isoformat()+'T00:00:00+00:00'
     with db() as c:
-        row=c.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
-        if not row:return jsonify(error='Account not found'),404
-        c.execute('UPDATE accounts SET name=?,share=?,loss_sharing=?,marketplace=? WHERE id=?',(d.get('name',row['name'])[:80],str(percent),int(bool(d.get('loss_sharing'))),d.get('marketplace',row['marketplace']),aid))
-        if str(percent)!=row['share'] or int(bool(d.get('loss_sharing')))!=row['loss_sharing']:
-            c.execute('INSERT INTO share_history(account_id,percent,loss_sharing,effective_at) VALUES(?,?,?,?)',(aid,str(percent),int(bool(d.get('loss_sharing'))),now()))
+        c.execute('UPDATE demo_stores SET name=?,fulfilment_mode=?,low_stock_threshold=?,share=?,loss_sharing=? WHERE id=?',(name,mode,threshold,str(share),loss_sharing,aid))
+        c.execute('INSERT INTO demo_share_history(store_id,percent,loss_sharing,effective_at) VALUES(?,?,?,?) ON CONFLICT(store_id,effective_at) DO UPDATE SET percent=excluded.percent,loss_sharing=excluded.loss_sharing',(aid,str(share),loss_sharing,effective_at))
     return jsonify(ok=True)
 
 @app.post('/api/costs')
-@login_required
+@manager_required
 def add_cost():
-    d=request.get_json(force=True); amount=money(d.get('amount'))
+    d=request.get_json(force=True); user=current_user()
+    try:store_id=int(d.get('store_id',d.get('account_id')))
+    except (TypeError,ValueError):return jsonify(error='Select a store'),400
+    if not allowed_store(user,store_id):return jsonify(error='Store not found'),404
+    try:
+        parsed=Decimal(str(d.get('amount')))
+        if not parsed.is_finite():raise InvalidOperation
+        amount=money(parsed)
+    except (InvalidOperation,ValueError,TypeError):return jsonify(error='Enter a valid cost amount'),400
     if Decimal(amount)<0:return jsonify(error='Costs must be zero or positive'),400
+    kind=d.get('kind','product')
+    if kind not in ('product','fulfilment','other'):return jsonify(error='Unsupported cost type'),400
+    currency=str(d.get('currency','')).upper()
+    if len(currency)!=3 or not currency.isalpha():return jsonify(error='Currency must be a three-letter code'),400
+    order_id=str(d.get('order_id') or '').strip() or None
+    sku=str(d.get('sku') or '').strip() or None
+    if not order_id and not sku:return jsonify(error='Enter an order ID or SKU'),400
     with db() as c:
-        c.execute('INSERT INTO costs(account_id,order_id,sku,kind,amount,currency,note,created_at) VALUES(?,?,?,?,?,?,?,?)',(int(d['account_id']),d.get('order_id') or None,d.get('sku') or None,d['kind'],amount,d['currency'],d.get('note',''),now()))
-        c.execute('INSERT INTO audit(account_id,order_id,event,source_json,created_at) VALUES(?,?,?,?,?)',(int(d['account_id']),d.get('order_id'), 'manual_cost',json.dumps(d),now()))
+        if order_id and not c.execute('SELECT 1 FROM demo_orders WHERE store_id=? AND order_id=?',(store_id,order_id)).fetchone():return jsonify(error='Order not found in this store'),404
+        c.execute('INSERT INTO demo_costs(store_id,order_id,sku,kind,amount,currency,note,created_at) VALUES(?,?,?,?,?,?,?,?)',(store_id,order_id,sku,kind,amount,currency,str(d.get('note',''))[:300],now()))
     return jsonify(ok=True)
 
 @app.post('/api/default-cost')
-@login_required
+@manager_required
 def default_cost():
-    d=request.get_json(force=True)
-    with db() as c:
-        c.execute('INSERT INTO sku_costs(account_id,sku,product_cost,fulfilment_cost,currency) VALUES(?,?,?,?,?) ON CONFLICT(account_id,sku) DO UPDATE SET product_cost=excluded.product_cost,fulfilment_cost=excluded.fulfilment_cost,currency=excluded.currency',(int(d['account_id']),d['sku'],money(d.get('product_cost')),money(d.get('fulfilment_cost')),d['currency']))
-    return jsonify(ok=True)
+    return jsonify(error='SKU defaults are not part of the current demo. Add an order cost instead.'),501
 
 @app.post('/api/import-costs')
-@login_required
+@manager_required
 def import_costs():
     if 'file' not in request.files:return jsonify(error='Choose a CSV file'),400
-    stream=io.StringIO(request.files['file'].stream.read().decode('utf-8-sig')); reader=csv.DictReader(stream); count=0
-    with db() as c:
+    try:stream=io.StringIO(request.files['file'].stream.read().decode('utf-8-sig'))
+    except UnicodeDecodeError:return jsonify(error='CSV must be UTF-8 encoded'),400
+    reader=csv.DictReader(stream); rows=[]; user=current_user(); allowed=set(allowed_store_ids(user['id']))
+    try:
         for row in reader:
-            aid=int(row['account_id']); kind=row.get('kind','product')
-            c.execute('INSERT INTO costs(account_id,order_id,sku,kind,amount,currency,note,created_at) VALUES(?,?,?,?,?,?,?,?)',(aid,row.get('order_id') or None,row.get('sku') or None,kind,money(row['amount']),row['currency'],row.get('note','CSV import'),now())); count+=1
-    return jsonify(imported=count)
+            store_id=int(row.get('store_id') or row.get('account_id') or '')
+            if store_id not in allowed:return jsonify(error='CSV contains a store you cannot manage'),404
+            kind=row.get('kind','product')
+            if kind not in ('product','fulfilment','other'):return jsonify(error='CSV contains an unsupported cost type'),400
+            parsed=Decimal(str(row['amount']))
+            if not parsed.is_finite():raise InvalidOperation
+            amount=money(parsed)
+            if Decimal(amount)<0:return jsonify(error='Costs must be zero or positive'),400
+            currency=str(row['currency']).upper()
+            if len(currency)!=3 or not currency.isalpha():return jsonify(error='Currency must be a three-letter code'),400
+            order_id=str(row.get('order_id') or '').strip() or None
+            sku=str(row.get('sku') or '').strip() or None
+            if not order_id and not sku:return jsonify(error='Each row must include an order ID or SKU'),400
+            rows.append((store_id,order_id,sku,kind,amount,currency,str(row.get('note','CSV import'))[:300]))
+    except (TypeError,ValueError,KeyError,InvalidOperation):return jsonify(error='CSV row is invalid; expected store_id, order_id, sku, kind, amount, currency, note'),400
+    if len(rows)>5000:return jsonify(error='CSV is limited to 5,000 cost rows'),400
+    with db() as c:
+        for store_id,order_id,sku,kind,amount,currency,note in rows:
+            if order_id and not c.execute('SELECT 1 FROM demo_orders WHERE store_id=? AND order_id=?',(store_id,order_id)).fetchone():return jsonify(error='CSV order ID does not belong to the selected store'),404
+        c.executemany('INSERT INTO demo_costs(store_id,order_id,sku,kind,amount,currency,note,created_at) VALUES(?,?,?,?,?,?,?,?)',[(sid,oid,sku,kind,amount,currency,note,now()) for sid,oid,sku,kind,amount,currency,note in rows])
+    return jsonify(imported=len(rows))
 
 @app.get('/api/export/<kind>.csv')
 @login_required
 def export(kind):
     if kind not in ('orders','profit'):return 'Unknown export',404
-    state_data=state().get_json(); out=io.StringIO(); w=csv.writer(out)
-    w.writerow(['account','order_id','created_at','currency','sales','marketplace_tax','refunds','fees','product_cost','fulfilment_cost','other_cost','net_profit','share_percent','my_share','missing_costs'])
-    for o in state_data['orders']:
-        calc=calculate(o,state_data['costs'],state_data['defaults'],state_data['accounts'],state_data['history'])
-        if kind=='orders' or kind=='profit':
-            w.writerow([calc['account'],o['order_id'],o['created_at'],o['currency'],o['proceeds'],o['tax'],o['refunds'],o['fees'],calc['product'],calc['fulfilment'],calc['other'],calc['profit'],calc['share'],calc['my_share'],calc['missing']])
+    user=current_user(); state_data=build_demo_state(user); accounts=state_data['stores']; allowed={a['id'] for a in accounts}
+    requested=request.args.get('store_id',request.args.get('account_id'))
+    if requested and requested!='all':
+        try:store_id=int(requested)
+        except ValueError:return jsonify(error='Invalid store selector'),400
+        if store_id not in allowed:return jsonify(error='Store not found'),404
+        allowed={store_id}
+    try:orders=filter_export_orders(state_data['orders'],allowed)
+    except ValueError:return jsonify(error='Invalid or reversed date range'),400
+    out=io.StringIO(); w=csv.writer(out)
+    w.writerow(['store','order_id','created_at','currency','sales','marketplace_tax','refunds','fees','known_costs','estimated_profit','share_percent','my_share','missing_costs'])
+    for o in orders:
+        calc=o['calculation']
+        w.writerow([calc['account'],o['order_id'],o['created_at'],o['currency'],o['proceeds'],o['tax'],o['refunds'],o['fees'],money(Decimal(calc['product'])+Decimal(calc['fulfilment'])+Decimal(calc['other'])),calc['profit'],calc['share'],calc['my_share'],calc['missing']])
     return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename="{kind}.csv"'})
+
+def filter_export_orders(orders,allowed_ids):
+    start=request.args.get('from'); end=request.args.get('to'); query=request.args.get('q','').strip().lower()
+    try:
+        after=datetime.fromisoformat(start).date() if start else None
+        before=datetime.fromisoformat(end).date() if end else None
+    except ValueError:
+        raise ValueError('Invalid date')
+    if after and before and after>before:raise ValueError('Reversed date range')
+    selected=[]
+    for order in orders:
+        date=datetime.fromisoformat(order['created_at'].replace('Z','+00:00')).date()
+        if order['account_id'] not in allowed_ids or (after and date<after) or (before and date>before):continue
+        if query and query not in order['order_id'].lower() and query not in json.dumps(order['source_json']).lower():continue
+        selected.append(order)
+    return selected
 
 def calculate(o,costs,defaults,accounts,history):
     account=next((a for a in accounts if a['id']==o['account_id']),{})
     exact=[c for c in costs if c['account_id']==o['account_id'] and c['order_id']==o['order_id']]
-    sku_rows=[c for c in costs if c['account_id']==o['account_id'] and c['sku'] and c['sku'] in [i.get('sku') for i in o.get('source_json',{}).get('lineItems',[])]]
+    # SKU-level rows are defaults (no order_id); never apply another order's
+    # actual cost to this order just because the SKU matches.
+    sku_rows=[c for c in costs if c['account_id']==o['account_id'] and not c.get('order_id') and c['sku'] and c['sku'] in [i.get('sku') for i in o.get('source_json',{}).get('lineItems',[])]]
     costrows=exact+sku_rows
     for line in o.get('source_json',{}).get('lineItems',[]):
         d=next((x for x in defaults if x['account_id']==o['account_id'] and x['sku']==line.get('sku')),None)
@@ -197,10 +393,12 @@ def calculate(o,costs,defaults,accounts,history):
     if missing: profit=None
     account_history=[h for h in history if h['account_id']==o['account_id']]
     shares=[h for h in account_history if h['effective_at']<= (o.get('created_at') or '')]
-    share=shares[-1]['percent'] if shares else (account.get('share','0') if not account_history else None)
+    share_record=shares[-1] if shares else None
+    share=share_record['percent'] if share_record else (account.get('share','0') if not account_history else None)
+    loss_sharing=share_record.get('loss_sharing',account.get('loss_sharing',0)) if share_record else account.get('loss_sharing',0)
     if share is None: missing=True
     mine=Decimal(0) if profit is None or share is None else profit*Decimal(share)/100
-    if profit is not None and profit<0 and not account.get('loss_sharing'): mine=Decimal(0)
+    if profit is not None and profit<0 and not loss_sharing: mine=Decimal(0)
     return {'account':account.get('name','Unknown'),'product':money(sums['product']),'fulfilment':money(sums['fulfilment']),'other':money(sums['other']),'profit':money(profit) if not missing else None,'share':share,'my_share':money(mine) if not missing else None,'missing':missing}
 
 def save_api_snapshot(aid, table, records):
@@ -262,35 +460,25 @@ def ebay_get(aid,path,params=None):
     r.raise_for_status()
 
 @app.get('/oauth/connect/<int:aid>')
-@login_required
+@manager_required
 def oauth_connect(aid):
-    if not os.getenv('EBAY_CLIENT_ID') or not os.getenv('EBAY_RUNAME'):return 'Configure eBay client ID and RuName in .env',503
-    state=secrets.token_urlsafe(24); session['oauth_state']=state;session['oauth_account']=aid
-    params={'client_id':os.getenv('EBAY_CLIENT_ID'),'response_type':'code','redirect_uri':os.getenv('EBAY_RUNAME'),'scope':' '.join(SCOPES),'state':state}
-    return redirect(oauth_host()+'/oauth2/authorize?'+urlencode(params))
+    return jsonify(error='Live eBay OAuth is disabled in the current synthetic demo phase'),501
 
 @app.get('/oauth/callback')
+@manager_required
 def oauth_callback():
-    if not session.get('owner'):return redirect('/?login=1')
-    if request.args.get('state')!=session.pop('oauth_state',None):return 'OAuth state validation failed',400
-    aid=session.pop('oauth_account',None); code=request.args.get('code')
-    if not aid or not code:return 'Missing OAuth authorization response',400
-    basic=requests.auth._basic_auth_str(os.getenv('EBAY_CLIENT_ID',''),os.getenv('EBAY_CLIENT_SECRET',''))
-    r=requests.post(ebay_base()+'/identity/v1/oauth2/token',headers={'Authorization':basic,'Content-Type':'application/x-www-form-urlencoded'},data={'grant_type':'authorization_code','code':code,'redirect_uri':os.getenv('EBAY_RUNAME')},timeout=30)
-    if not r.ok:return 'eBay token exchange failed; check portal redirect URI and application keys',502
-    data=r.json()
-    with db() as c:c.execute('UPDATE accounts SET connected=1,token=?,refresh_token=?,token_expires=?,error=NULL WHERE id=?',(encrypt(data['access_token']),encrypt(data['refresh_token']), (datetime.now(timezone.utc)+timedelta(seconds=data['expires_in'])).isoformat(),aid))
-    return redirect('/?connected=1')
+    return jsonify(error='Live eBay OAuth is disabled in the current synthetic demo phase'),501
 
 @app.post('/api/disconnect/<int:aid>')
-@login_required
+@manager_required
 def disconnect(aid):
-    with db() as c:c.execute('UPDATE accounts SET connected=0,token=NULL,refresh_token=NULL,token_expires=NULL,error=NULL WHERE id=?',(aid,))
-    return jsonify(ok=True)
+    return jsonify(error='Live eBay account management is disabled in the current synthetic demo phase'),501
 
 @app.post('/api/sync/<int:aid>')
-@login_required
+@manager_required
 def sync(aid):
+    return jsonify(error='Live eBay sync is disabled in the current synthetic demo phase'),501
+    # Retained below for the future live-data phase; demo routes never call it.
     try:
         with db() as c:a=c.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
         if not a: return jsonify(error='Account not found'),404
