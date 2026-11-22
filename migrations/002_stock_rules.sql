@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS stock_rules(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id), sku TEXT NOT NULL, threshold INTEGER NOT NULL DEFAULT 3 CHECK(threshold >= 0), updated_at TEXT NOT NULL, UNIQUE(account_id,sku));
