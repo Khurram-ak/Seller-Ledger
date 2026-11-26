@@ -4,12 +4,14 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
+import xml.etree.ElementTree as ET
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from cryptography.fernet import Fernet
@@ -27,6 +29,7 @@ SCOPES = [
     'https://api.ebay.com/oauth/api_scope/sell.finances',
     'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
     'https://api.ebay.com/oauth/api_scope/sell.analytics.readonly',
+    'https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
 ]
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -64,6 +67,15 @@ def init_db():
         if not c.execute('SELECT 1 FROM schema_migrations WHERE version=5').fetchone():
             with open(os.path.join(ROOT,'migrations','005_demo_share_history.sql'),encoding='utf-8') as f:c.executescript(f.read())
             c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=6').fetchone():
+            with open(os.path.join(ROOT,'migrations','006_live_ebay_stores.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=7').fetchone():
+            with open(os.path.join(ROOT,'migrations','007_cost_sheets.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=8').fetchone():
+            with open(os.path.join(ROOT,'migrations','008_listings.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)',(now(),))
         # Seed a fresh database once. Never recreate defaults when an owner has
         # renamed or removed their accounts.
         if c.execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 0:
@@ -106,15 +118,18 @@ def seed_demo_users():
     if len(manager_password)<12 or len(client_password)<12:
         return False
     with db() as c:
-        stores=[r['id'] for r in c.execute('SELECT id FROM demo_stores ORDER BY id')]
+        stores=[r['id'] for r in c.execute("SELECT id FROM demo_stores WHERE source='demo' ORDER BY id")]
         if len(stores)<4:
             raise RuntimeError('Demo stores are not initialized')
         credentials=[(os.getenv('DEMO_MANAGER_USERNAME','manager@demo.local'),'Demo Manager','manager',manager_password,stores),(os.getenv('DEMO_CLIENT_USERNAME','client@demo.local'),'Demo Client','client',client_password,[stores[0]])]
         for username,display,role,password,assigned in credentials:
             c.execute('INSERT INTO users(username,display_name,password_hash,role,active,created_at) VALUES(?,?,?,?,1,?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name,password_hash=excluded.password_hash,role=excluded.role,active=1',(username,display,generate_password_hash(password,method='scrypt'),role,now()))
             user_id=c.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone()['id']
-            c.execute('DELETE FROM demo_user_stores WHERE user_id=?',(user_id,))
-            c.executemany('INSERT INTO demo_user_stores(user_id,store_id) VALUES(?,?)',[(user_id,sid) for sid in assigned])
+            # Only reset synthetic-store assignments; live eBay store access is managed in the app and must survive restarts.
+            c.execute("DELETE FROM demo_user_stores WHERE user_id=? AND store_id IN (SELECT id FROM demo_stores WHERE source='demo')",(user_id,))
+            c.executemany('INSERT OR IGNORE INTO demo_user_stores(user_id,store_id) VALUES(?,?)',[(user_id,sid) for sid in assigned])
+            if role=='manager':
+                c.execute("INSERT OR IGNORE INTO demo_user_stores(user_id,store_id) SELECT ?,id FROM demo_stores WHERE source='ebay'",(user_id,))
     return True
 
 def current_user():
@@ -186,6 +201,16 @@ def home():
     session.setdefault('csrf',secrets.token_urlsafe(32))
     return render_template('index.html')
 
+LOGIN_FAILS={};LOGIN_WINDOW=900;LOGIN_MAX=5
+def client_ip():
+    # Behind Cloudflare Tunnel every request arrives from localhost; trust its header only then.
+    if request.remote_addr in ('127.0.0.1','::1') and request.headers.get('CF-Connecting-IP'):return request.headers['CF-Connecting-IP']
+    return request.remote_addr or '?'
+def too_many_failures(key):
+    cutoff=time.time()-LOGIN_WINDOW;LOGIN_FAILS[key]=[t for t in LOGIN_FAILS.get(key,[]) if t>cutoff]
+    return len(LOGIN_FAILS[key])>=LOGIN_MAX
+def record_failure(key):LOGIN_FAILS.setdefault(key,[]).append(time.time())
+
 @app.route('/login',methods=['GET','POST'])
 def login():
     if current_user():
@@ -195,6 +220,10 @@ def login():
     if request.method=='POST':
         username=request.form.get('username','').strip()
         password=request.form.get('password','')
+        keys=(('ip',client_ip()),('user',username.lower()))
+        if any(too_many_failures(k) for k in keys):
+            error='Too many failed sign-ins. Wait 15 minutes and try again.'
+            return render_template('login.html',csrf=session['csrf'],configured=True,error=error),429
         with db() as c:
             row=c.execute('SELECT * FROM users WHERE username=? AND active=1',(username,)).fetchone()
         if row and check_password_hash(row['password_hash'],password):
@@ -203,6 +232,7 @@ def login():
             session['csrf']=secrets.token_urlsafe(32)
             session.permanent=True
             return redirect(url_for('home'))
+        for k in keys:record_failure(k)
         error='Username or password is incorrect.'
     with db() as c:
         configured=c.execute('SELECT COUNT(*) FROM users WHERE active=1').fetchone()[0]>0
@@ -214,22 +244,105 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+def live_mode():
+    """True once any eBay store exists: live stores then replace the synthetic demo everywhere."""
+    with db() as c:
+        return bool(c.execute("SELECT 1 FROM demo_stores WHERE source='ebay' LIMIT 1").fetchone())
+
+def visible_store_ids(user_id):
+    ids=allowed_store_ids(user_id)
+    if not ids or not live_mode():return ids
+    with db() as c:
+        live={r['id'] for r in c.execute("SELECT id FROM demo_stores WHERE source='ebay'")}
+    return [i for i in ids if i in live]
+
+def sku_defaults(costs):
+    """Latest product/fulfilment cost per (store, SKU) from cost rows with no order ID.
+    These apply per unit to every order of that SKU and count as a known product cost."""
+    latest={}
+    for row in sorted(costs,key=lambda r:r['id']):
+        if row.get('order_id') or not row.get('sku') or row['kind'] not in ('product','fulfilment'):continue
+        d=latest.setdefault((row['account_id'],row['sku']),{'account_id':row['account_id'],'sku':row['sku'],'product_cost':None,'fulfilment_cost':'0','currency':row['currency']})
+        d[row['kind']+'_cost']=row['amount']
+    return [d for d in latest.values() if d['product_cost'] is not None]
+
+def sheet_estimates(orders,costs):
+    """Per-unit cost of each (store, SKU) from its most recent single-item order in the cost sheet."""
+    by_order={(o['account_id'],o['order_id']):o for o in orders}
+    rows={}
+    for x in costs:
+        if x.get('source')=='sheet' and x['kind'] in ('product','fulfilment'):rows.setdefault((x['account_id'],x['order_id']),[]).append(x)
+    out={}
+    for key,xs in rows.items():
+        o=by_order.get(key);lines=(o or {}).get('source_json',{}).get('lineItems',[])
+        if not o or len(lines)!=1 or not lines[0].get('sku'):continue
+        qty=Decimal(str(lines[0].get('quantity') or 1));sku=lines[0]['sku']
+        prev=out.get((key[0],sku))
+        if prev and prev['_at']>=o['created_at']:continue
+        get=lambda k:sum((Decimal(x['amount']) for x in xs if x['kind']==k),Decimal(0))
+        out[(key[0],sku)]={'account_id':key[0],'sku':sku,'product_cost':str(get('product')/qty),'fulfilment_cost':str(get('fulfilment')/qty),'currency':xs[0]['currency'],'_at':o['created_at'],'estimate':True}
+    return out
+
 def build_demo_state(user):
-    ids=allowed_store_ids(user['id'])
+    ids=visible_store_ids(user['id']); live=live_mode()
+    base={'user':{'name':user['display_name'],'role':user['role']},'dataset':'LIVE EBAY' if live else 'SYNTHETIC DEMO','live':live,'csrf':session.get('csrf')}
+    if user['role']=='manager':base['ebay']=ebay_status()
     if not ids:
-        return {'user':{'name':user['display_name'],'role':user['role']},'dataset':'SYNTHETIC DEMO','stores':[],'orders':[],'costs':[],'defaults':[],'history':[],'csrf':session.get('csrf')}
+        if user['role']=='manager':base['clients']=client_access([])
+        return {**base,'stores':[],'orders':[],'costs':[],'defaults':[],'history':[]}
     marks=','.join('?' for _ in ids)
     with db() as c:
-        stores=[dict(r) for r in c.execute(f'SELECT id,name,currency,share,loss_sharing,fulfilment_mode,low_stock_threshold FROM demo_stores WHERE id IN ({marks}) ORDER BY id',ids)]
+        stores=[dict(r) for r in c.execute(f'SELECT id,name,currency,share,loss_sharing,fulfilment_mode,low_stock_threshold,source,ebay_user,connected,sync_at,sync_error FROM demo_stores WHERE id IN ({marks}) ORDER BY id',ids)]
         history=[dict(r) for r in c.execute(f'SELECT store_id AS account_id,percent,effective_at,loss_sharing FROM demo_share_history WHERE store_id IN ({marks}) ORDER BY effective_at,id',ids)]
-        orders=[dict(r) for r in c.execute(f'SELECT id,store_id AS account_id,order_id,created_at,currency,proceeds,tax,refunds,fees,status,source_json FROM demo_orders WHERE store_id IN ({marks}) ORDER BY created_at DESC',ids)]
-        costs=[dict(r) for r in c.execute(f'SELECT id,store_id AS account_id,order_id,sku,kind,amount,currency,note FROM demo_costs WHERE store_id IN ({marks})',ids)]
+        orders=[dict(r) for r in c.execute(f"SELECT id,store_id AS account_id,order_id,created_at,currency,proceeds,tax,refunds,fees,status,source_json FROM demo_orders WHERE store_id IN ({marks}) AND status!='CANCELLED' ORDER BY created_at DESC",ids)]
+        costs=[dict(r) for r in c.execute(f'SELECT id,store_id AS account_id,order_id,sku,kind,amount,currency,note,source FROM demo_costs WHERE store_id IN ({marks})',ids)]
+    defaults=sku_defaults(costs)
+    # SKU product/fulfilment rows are applied per unit via defaults; keep only order-level and 'other' rows as direct costs.
+    order_costs=[x for x in costs if x.get('order_id') or x['kind']=='other']
+    has_order_product={(x['account_id'],x['order_id']) for x in costs if x.get('order_id') and x['kind']=='product'}
+    fee_from_sheet={(x['account_id'],x['order_id']) for x in costs if x.get('source')=='sheet-fee'}
+    for order in orders:order['source_json']=json.loads(order['source_json'])
+    estimates=sheet_estimates(orders,costs)
     for order in orders:
-        order['source_json']=json.loads(order['source_json'])
-        result=calculate(order,costs,[],stores,history)
-        order['calculation']=result
-        order['demo']=True
-    return {'user':{'name':user['display_name'],'role':user['role']},'dataset':'SYNTHETIC DEMO','stores':stores,'orders':orders,'costs':costs,'defaults':[],'history':[],'csrf':session.get('csrf')}
+        for k in ('proceeds','tax','refunds','fees'):
+            if order[k]=='':order[k]=None  # unknown from eBay; never treated as zero in profit
+        key=(order['account_id'],order['order_id'])
+        if order['fees'] is None and key in fee_from_sheet:order['fees']='0.00'  # fee is carried as a sheet-derived 'other' cost
+        # An order-level product cost (e.g. from the cost sheet) replaces per-item defaults so nothing is counted twice.
+        if key in has_order_product:order['calculation']=calculate(order,order_costs,[],stores,history)
+        else:
+            # No actual cost yet: fall back to this item's latest cost-sheet cost, flagged as an estimate.
+            have={(d['account_id'],d['sku']) for d in defaults}
+            est=[estimates[(order['account_id'],l.get('sku'))] for l in order['source_json'].get('lineItems',[]) if (order['account_id'],l.get('sku')) not in have and (order['account_id'],l.get('sku')) in estimates]
+            order['calculation']=calculate(order,order_costs,defaults+est,stores,history)
+            order['calculation']['estimated']=bool(est) and order['calculation']['profit'] is not None
+        order['demo']=not live
+    with db() as c:
+        listings=[dict(r) for r in c.execute(f'''SELECT l.store_id AS account_id,l.item_id,l.title,l.price,l.currency,l.quantity,l.quantity_available,l.quantity_sold,l.watch_count,l.has_variations,l.start_time,l.view_url,l.image_url,l.status,
+            t.days AS traffic_days,t.impressions,t.views,t.transactions,t.ctr,t.conversion FROM demo_listings l LEFT JOIN demo_listing_traffic t ON t.store_id=l.store_id AND t.item_id=l.item_id WHERE l.store_id IN ({marks})''',ids)]
+    out={**base,'stores':stores,'orders':orders,'costs':costs,'defaults':defaults,'history':[],'listings':listings}
+    if user['role']=='manager':out['clients']=client_access(ids)
+    return out
+
+def client_access(store_ids):
+    with db() as c:
+        users=[dict(r) for r in c.execute("SELECT id,username,display_name FROM users WHERE role='client' AND active=1 ORDER BY username")]
+        for u in users:
+            u['store_ids']=[r['store_id'] for r in c.execute('SELECT store_id FROM demo_user_stores WHERE user_id=?',(u['id'],)) if r['store_id'] in store_ids]
+    return users
+
+@app.post('/api/client-access')
+@manager_required
+def set_client_access():
+    d=request.get_json(force=True); user=current_user()
+    try:client_id=int(d.get('client_id'));store_id=int(d.get('store_id'))
+    except (TypeError,ValueError):return jsonify(error='Choose a client and a store'),400
+    if not allowed_store(user,store_id):return jsonify(error='Store not found'),404
+    with db() as c:
+        if not c.execute("SELECT 1 FROM users WHERE id=? AND role='client'",(client_id,)).fetchone():return jsonify(error='Client not found'),404
+        if d.get('grant'):c.execute('INSERT OR IGNORE INTO demo_user_stores(user_id,store_id) VALUES(?,?)',(client_id,store_id))
+        else:c.execute('DELETE FROM demo_user_stores WHERE user_id=? AND store_id=?',(client_id,store_id))
+    return jsonify(ok=True)
 
 @app.get('/api/state')
 @login_required
@@ -401,142 +514,373 @@ def calculate(o,costs,defaults,accounts,history):
     if profit is not None and profit<0 and not loss_sharing: mine=Decimal(0)
     return {'account':account.get('name','Unknown'),'product':money(sums['product']),'fulfilment':money(sums['fulfilment']),'other':money(sums['other']),'profit':money(profit) if not missing else None,'share':share,'my_share':money(mine) if not missing else None,'missing':missing}
 
-def save_api_snapshot(aid, table, records):
+# ---------------------------------------------------------------- live eBay
+# Read-only seller integration. Tokens are Fernet-encrypted at rest (TOKEN_ENCRYPTION_KEY).
+# Orders come from the Fulfillment API, which includes marketplace fees and refunds per order,
+# so UK sellers don't need the Finances API (that one requires digital-signature keys in the EU/UK).
+SYNC_LOCK=threading.Lock()
+
+def apiz_base(): return 'https://apiz.sandbox.ebay.com' if os.getenv('EBAY_ENV','production')=='sandbox' else 'https://apiz.ebay.com'
+
+def ebay_config_missing():
+    need=['EBAY_CLIENT_ID','EBAY_CLIENT_SECRET','EBAY_RUNAME','TOKEN_ENCRYPTION_KEY']
+    return [k for k in need if not os.getenv(k)]
+
+def ebay_status():
     with db() as c:
-        if table=='listing':
-            for x in records:
-                c.execute('INSERT INTO listings(account_id,sku,offer_id,title,quantity,status,source_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,offer_id) DO UPDATE SET sku=excluded.sku,title=excluded.title,quantity=excluded.quantity,status=excluded.status,source_json=excluded.source_json',(aid,x.get('sku'),str(x.get('offerId') or x.get('sku') or ''),x.get('title'),x.get('quantityAvailable'),x.get('status'),json.dumps(x)))
-        elif table=='metric':
-            for x in records:c.execute('INSERT INTO metrics(account_id,day,payload) VALUES(?,?,?)',(aid,x.get('date') or x.get('dimensionKey') or now()[:10],json.dumps(x)))
+        stores=[dict(r) for r in c.execute("SELECT id,name,ebay_user,connected,sync_at,sync_error,refresh_expires,cost_sheet_url,cost_sheet_at,cost_sheet_report,(SELECT COUNT(*) FROM demo_orders o WHERE o.store_id=s.id) AS orders FROM demo_stores s WHERE source='ebay' ORDER BY id")]
+    return {'configured':not ebay_config_missing(),'missing':ebay_config_missing(),'env':os.getenv('EBAY_ENV','production'),'stores':stores}
 
-def sync_inventory(aid, marketplace):
-    items=[];offset=0
-    while True:
-        page=ebay_get(aid,'/sell/inventory/v1/inventory_item',{'limit':1000,'offset':offset}); batch=page.get('inventoryItems',[]);items+=batch
-        if len(batch)<1000:break
-        offset+=len(batch)
-    offers=[]
-    # getOffers is SKU scoped; limit calls to unique SKUs and preserve supported coverage.
-    for item in items:
-        sku=item.get('sku')
-        if not sku:continue
-        try:
-            out=ebay_get(aid,'/sell/inventory/v1/offer',{'sku':sku,'marketplace_id':marketplace,'limit':100})
-            for offer in out.get('offers',[]):
-                offer['sku']=sku;offer['quantityAvailable']=item.get('availability',{}).get('shipToLocationAvailability',{}).get('quantity')
-                offers.append(offer)
-        except Exception: continue
-    save_api_snapshot(aid,'listing',offers)
-    return len(items),len(offers)
+def basic_auth():
+    return requests.auth._basic_auth_str(os.getenv('EBAY_CLIENT_ID',''),os.getenv('EBAY_CLIENT_SECRET',''))
 
-def sync_analytics(aid,marketplace):
-    # eBay traffic reports accept a bounded 90-day window; request daily aggregates.
-    end=datetime.now(timezone.utc).date();start=end-timedelta(days=89)
-    filt=f'marketplace_ids:{{{marketplace}}},date_range:[{start:%Y%m%d}..{end:%Y%m%d}]'
-    payload=ebay_get(aid,'/sell/analytics/v1/traffic_report',{'dimension':'DAY','filter':filt,'metric':'LISTING_VIEWS_TOTAL,LISTING_SALES_CONVERSION_RATE'})
-    records=payload.get('records',[]);save_api_snapshot(aid,'metric',records);return len(records)
+def token_request(data):
+    r=requests.post(ebay_base()+'/identity/v1/oauth2/token',headers={'Authorization':basic_auth(),'Content-Type':'application/x-www-form-urlencoded'},data=data,timeout=30)
+    if r.status_code>=400:
+        try:detail=r.json().get('error_description') or r.json().get('error')
+        except ValueError:detail=r.text[:200]
+        raise RuntimeError(f'eBay token request failed ({r.status_code}): {detail}')
+    return r.json()
 
-def token_for(aid):
-    with db() as c: a=c.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
-    if not a or not a['refresh_token']:raise RuntimeError('Account is not connected')
+def token_for(store_id):
+    with db() as c:a=c.execute('SELECT token,token_expires,refresh_token FROM demo_stores WHERE id=?',(store_id,)).fetchone()
+    if not a or not a['refresh_token']:raise RuntimeError('Store is not connected to eBay. Reconnect it.')
     expires=datetime.fromisoformat(a['token_expires']) if a['token_expires'] else datetime.now(timezone.utc)
     if a['token'] and expires>datetime.now(timezone.utc)+timedelta(minutes=2):return decrypt(a['token'])
-    basic=requests.auth._basic_auth_str(os.getenv('EBAY_CLIENT_ID',''),os.getenv('EBAY_CLIENT_SECRET',''))
-    resp=requests.post(ebay_base()+'/identity/v1/oauth2/token',headers={'Authorization':basic,'Content-Type':'application/x-www-form-urlencoded'},data={'grant_type':'refresh_token','refresh_token':decrypt(a['refresh_token']),'scope':' '.join(SCOPES)},timeout=30)
-    resp.raise_for_status(); payload=resp.json()
-    with db() as c:c.execute('UPDATE accounts SET token=?,token_expires=? WHERE id=?',(encrypt(payload['access_token']), (datetime.now(timezone.utc)+timedelta(seconds=payload['expires_in'])).isoformat(),aid))
+    payload=token_request({'grant_type':'refresh_token','refresh_token':decrypt(a['refresh_token']),'scope':' '.join(SCOPES)})
+    with db() as c:c.execute('UPDATE demo_stores SET token=?,token_expires=? WHERE id=?',(encrypt(payload['access_token']),(datetime.now(timezone.utc)+timedelta(seconds=payload['expires_in'])).isoformat(),store_id))
     return payload['access_token']
 
-def ebay_get(aid,path,params=None):
-    token=token_for(aid); url=ebay_base()+path
+def ebay_get(store_id,url,params=None):
+    token=token_for(store_id)
     for attempt in range(4):
-        r=requests.get(url,headers={'Authorization':'Bearer '+token,'Accept':'application/json'},params=params,timeout=45)
+        r=requests.get(url,headers={'Authorization':'Bearer '+token,'Accept':'application/json','X-EBAY-C-MARKETPLACE-ID':os.getenv('EBAY_MARKETPLACE','EBAY_GB')},params=params,timeout=45)
         if r.status_code==429 or r.status_code>=500:
             time.sleep(min(2**attempt,12));continue
-        if r.status_code==401:
-            with db() as c:c.execute('UPDATE accounts SET token=NULL,token_expires=NULL WHERE id=?',(aid,))
-            token=token_for(aid);continue
-        r.raise_for_status();return r.json() if r.content else {}
-    r.raise_for_status()
+        if r.status_code==401 and attempt==0:
+            with db() as c:c.execute('UPDATE demo_stores SET token=NULL,token_expires=NULL WHERE id=?',(store_id,))
+            token=token_for(store_id);continue
+        if r.status_code>=400:
+            try:errs=r.json().get('errors',[]);detail='; '.join(e.get('longMessage') or e.get('message','') for e in errs)
+            except ValueError:detail=r.text[:200]
+            raise RuntimeError(f'eBay API {r.status_code} on {url.split(".com")[-1]}: {detail}'[:400])
+        return r.json() if r.content else {}
+    raise RuntimeError('eBay API kept failing (rate limit or server error); try again later')
 
-@app.get('/oauth/connect/<int:aid>')
+def dec(amount):
+    if not amount or amount.get('value') in (None,''):return None
+    try:return Decimal(str(amount['value']))
+    except InvalidOperation:return None
+
+def map_order(o):
+    """Map an eBay Fulfillment API order to dashboard fields. Unknown values become '' (never zero)."""
+    ps=o.get('pricingSummary',{})
+    subtotal=dec(ps.get('priceSubtotal'))
+    if subtotal is None:proceeds=None
+    else:
+        # deliveryDiscount and priceDiscount are negative values on eBay.
+        proceeds=subtotal+(dec(ps.get('deliveryCost')) or 0)+(dec(ps.get('deliveryDiscount')) or 0)+(dec(ps.get('priceDiscount')) or 0)
+    currency=(ps.get('priceSubtotal') or ps.get('total') or {}).get('currency') or 'GBP'
+    taxes=[dec(t.get('amount')) for li in o.get('lineItems',[]) for t in li.get('ebayCollectAndRemitTaxes',[])]
+    tax=sum((t for t in taxes if t is not None),Decimal(0)) if taxes else (dec(ps.get('tax')) or Decimal(0))
+    fees=dec(o.get('totalMarketplaceFee'))
+    refunds=sum((dec(r.get('amount')) or Decimal(0) for r in o.get('paymentSummary',{}).get('refunds',[]) if r.get('refundStatus')=='REFUNDED'),Decimal(0))
+    cancelled=(o.get('cancelStatus') or {}).get('cancelState')=='CANCELED'
+    lines=[{'sku':li.get('sku') or f"ITEM-{li.get('legacyItemId','unknown')}",'quantity':int(li.get('quantity') or 1),'title':li.get('title'),'legacyItemId':li.get('legacyItemId')} for li in o.get('lineItems',[])]
+    source={'lineItems':lines,'fulfillmentStatus':o.get('orderFulfillmentStatus'),'paymentStatus':o.get('orderPaymentStatus'),'ebay':True}
+    return {'order_id':o['orderId'],'created_at':o.get('creationDate'),'currency':currency,
+            'proceeds':money(proceeds) if proceeds is not None else '','tax':money(tax),'refunds':money(refunds),
+            'fees':money(fees) if fees is not None else '','status':'CANCELLED' if cancelled else (o.get('orderPaymentStatus') or 'UNKNOWN'),'source_json':json.dumps(source)}
+
+def sync_store(store_id):
+    """Incremental order sync. First run pulls EBAY_SYNC_DAYS (default 90) of history."""
+    with SYNC_LOCK:
+        with db() as c:st=c.execute("SELECT * FROM demo_stores WHERE id=? AND source='ebay'",(store_id,)).fetchone()
+        if not st:raise RuntimeError('Store not found')
+        started=datetime.now(timezone.utc)
+        days=max(1,min(int(os.getenv('EBAY_SYNC_DAYS','90')),730))
+        since=st['sync_cursor'] or (started-timedelta(days=days)).isoformat(timespec='milliseconds').replace('+00:00','Z')
+        try:
+            offset=0;total=0
+            while True:
+                page=ebay_get(store_id,ebay_base()+'/sell/fulfillment/v1/order',{'filter':f'lastmodifieddate:[{since}..]','limit':200,'offset':offset})
+                orders=page.get('orders',[])
+                with db() as c:
+                    for o in orders:
+                        m=map_order(o)
+                        c.execute("""INSERT INTO demo_orders(store_id,order_id,created_at,currency,proceeds,tax,refunds,fees,status,source_json) VALUES(?,?,?,?,?,?,?,?,?,?)
+                          ON CONFLICT(store_id,order_id) DO UPDATE SET created_at=excluded.created_at,currency=excluded.currency,proceeds=excluded.proceeds,tax=excluded.tax,refunds=excluded.refunds,fees=excluded.fees,status=excluded.status,source_json=excluded.source_json""",
+                          (store_id,m['order_id'],m['created_at'],m['currency'],m['proceeds'],m['tax'],m['refunds'],m['fees'],m['status'],m['source_json']))
+                total+=len(orders)
+                if len(orders)<200 or offset+200>=int(page.get('total',0) or 0):break
+                offset+=200
+            # Overlap the next window by 5 minutes so late-indexed changes aren't missed.
+            cursor=(started-timedelta(minutes=5)).isoformat(timespec='milliseconds').replace('+00:00','Z')
+            with db() as c:c.execute('UPDATE demo_stores SET sync_at=?,sync_cursor=?,sync_error=NULL WHERE id=?',(now(),cursor,store_id))
+            problems=[]
+            for label,fn in (('Listings',sync_listings),('Traffic',sync_traffic),('Cost sheet',fetch_and_import_sheet)):
+                try:fn(store_id)
+                except Exception as e:problems.append(f'{label}: {str(e)[:200]}')
+            if problems:
+                with db() as c:c.execute('UPDATE demo_stores SET sync_error=? WHERE id=?',('; '.join(problems),store_id))
+            return total
+        except Exception as e:
+            with db() as c:c.execute('UPDATE demo_stores SET sync_error=? WHERE id=?',(str(e)[:400],store_id))
+            raise
+
+def sync_all():
+    with db() as c:ids=[r['id'] for r in c.execute("SELECT id FROM demo_stores WHERE source='ebay' AND connected=1")]
+    for sid in ids:
+        try:sync_store(sid)
+        except Exception as e:app.logger.warning('eBay sync failed for store %s: %s',sid,e)
+
+def start_auto_sync():
+    minutes=int(os.getenv('EBAY_AUTO_SYNC_MINUTES','30') or 0)
+    if minutes<=0 or ebay_config_missing():return
+    def loop():
+        while True:
+            sync_all();time.sleep(minutes*60)
+    threading.Thread(target=loop,daemon=True,name='ebay-auto-sync').start()
+
+# ---------------------------------------------------------------- listings
+TRADING_NS='{urn:ebay:apis:eBLBaseComponents}'
+TRAFFIC_DAYS=30
+
+def trading_call(store_id,call,body):
+    xml=f'<?xml version="1.0" encoding="utf-8"?><{call}Request xmlns="urn:ebay:apis:eBLBaseComponents">{body}</{call}Request>'
+    trading='https://api.sandbox.ebay.com/ws/api.dll' if os.getenv('EBAY_ENV','production')=='sandbox' else 'https://api.ebay.com/ws/api.dll'
+    r=requests.post(trading,data=xml.encode(),headers={'X-EBAY-API-IAF-TOKEN':token_for(store_id),'X-EBAY-API-CALL-NAME':call,'X-EBAY-API-SITEID':'3','X-EBAY-API-COMPATIBILITY-LEVEL':'1225','Content-Type':'text/xml'},timeout=60)
+    root=ET.fromstring(r.content)
+    if root.findtext(TRADING_NS+'Ack') not in ('Success','Warning'):
+        msg=root.findtext(f'.//{TRADING_NS}Errors/{TRADING_NS}LongMessage') or f'HTTP {r.status_code}'
+        raise RuntimeError(f'eBay {call}: {msg}'[:300])
+    return root
+
+def parse_listing(item):
+    t=lambda path:item.findtext('/'.join(TRADING_NS+p for p in path.split('/')))
+    price_el=item.find(f'{TRADING_NS}SellingStatus/{TRADING_NS}CurrentPrice')
+    variations=item.findall(f'{TRADING_NS}Variations/{TRADING_NS}Variation')
+    prices=[Decimal(v.findtext(TRADING_NS+'StartPrice')) for v in variations if v.findtext(TRADING_NS+'StartPrice')]
+    price=price_el.text if price_el is not None else (str(min(prices)) if prices else None)
+    currency=price_el.get('currencyID') if price_el is not None else 'GBP'
+    as_int=lambda v:int(v) if v not in (None,'') else None
+    qty=as_int(t('Quantity'));sold=as_int(t('SellingStatus/QuantitySold'))
+    avail=as_int(t('QuantityAvailable'))
+    if variations:
+        qty=sum(as_int(v.findtext(TRADING_NS+'Quantity')) or 0 for v in variations)
+        sold=sum(as_int(v.findtext(f'{TRADING_NS}SellingStatus/{TRADING_NS}QuantitySold')) or 0 for v in variations)
+        avail=qty-sold
+    if avail is None and qty is not None:avail=qty-(sold or 0)
+    return {'item_id':t('ItemID'),'title':t('Title'),'price':money(price) if price else None,'currency':currency,'quantity':qty,'quantity_available':avail,'quantity_sold':sold,
+            'watch_count':as_int(t('WatchCount')) or 0,'has_variations':1 if variations else 0,'start_time':t('ListingDetails/StartTime'),'view_url':t('ListingDetails/ViewItemURL'),'image_url':t('PictureDetails/GalleryURL')}
+
+def sync_listings(store_id):
+    items=[];page=1
+    while True:
+        root=trading_call(store_id,'GetMyeBaySelling',f'<ActiveList><Include>true</Include><Pagination><EntriesPerPage>200</EntriesPerPage><PageNumber>{page}</PageNumber></Pagination></ActiveList><DetailLevel>ReturnAll</DetailLevel>')
+        batch=root.findall(f'.//{TRADING_NS}ActiveList/{TRADING_NS}ItemArray/{TRADING_NS}Item')
+        items+=[parse_listing(i) for i in batch]
+        pages=int(root.findtext(f'.//{TRADING_NS}ActiveList/{TRADING_NS}PaginationResult/{TRADING_NS}TotalNumberOfPages') or 1)
+        if page>=pages or not batch:break
+        page+=1
+    ts=now()
+    with db() as c:
+        # Anything no longer in the active list has ended (or sold out without auto-relist).
+        c.execute("UPDATE demo_listings SET status='ENDED' WHERE store_id=?",(store_id,))
+        for x in items:
+            if not x['item_id']:continue
+            c.execute("""INSERT INTO demo_listings(store_id,item_id,title,price,currency,quantity,quantity_available,quantity_sold,watch_count,has_variations,start_time,view_url,image_url,status,updated_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE',?) ON CONFLICT(store_id,item_id) DO UPDATE SET title=excluded.title,price=excluded.price,currency=excluded.currency,quantity=excluded.quantity,
+              quantity_available=excluded.quantity_available,quantity_sold=excluded.quantity_sold,watch_count=excluded.watch_count,has_variations=excluded.has_variations,start_time=excluded.start_time,
+              view_url=excluded.view_url,image_url=excluded.image_url,status='ACTIVE',updated_at=excluded.updated_at""",
+              (store_id,x['item_id'],x['title'],x['price'],x['currency'],x['quantity'],x['quantity_available'],x['quantity_sold'],x['watch_count'],x['has_variations'],x['start_time'],x['view_url'],x['image_url'],ts))
+    return len(items)
+
+def sync_traffic(store_id):
+    end=datetime.now(timezone.utc).date();start=end-timedelta(days=TRAFFIC_DAYS-1)
+    market=os.getenv('EBAY_MARKETPLACE','EBAY_GB')
+    d=ebay_get(store_id,ebay_base()+'/sell/analytics/v1/traffic_report',{'dimension':'LISTING','filter':f'marketplace_ids:{{{market}}},date_range:[{start:%Y%m%d}..{end:%Y%m%d}]','metric':'LISTING_IMPRESSION_TOTAL,LISTING_VIEWS_TOTAL,TRANSACTION,CLICK_THROUGH_RATE,SALES_CONVERSION_RATE'})
+    keys=[m.get('key') for m in d.get('header',{}).get('metrics',[])]
+    ts=now()
+    with db() as c:
+        c.execute('DELETE FROM demo_listing_traffic WHERE store_id=?',(store_id,))
+        for rec in d.get('records',[]):
+            item=(rec.get('dimensionValues') or [{}])[0].get('value')
+            vals={k:(v.get('value') if v.get('applicable',True) else None) for k,v in zip(keys,rec.get('metricValues',[]))}
+            if not item:continue
+            c.execute('INSERT INTO demo_listing_traffic(store_id,item_id,days,impressions,views,transactions,ctr,conversion,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+              (store_id,str(item),TRAFFIC_DAYS,vals.get('LISTING_IMPRESSION_TOTAL'),vals.get('LISTING_VIEWS_TOTAL'),vals.get('TRANSACTION'),vals.get('CLICK_THROUGH_RATE'),vals.get('SALES_CONVERSION_RATE'),ts))
+    return len(d.get('records',[]))
+
+# ---------------------------------------------------------------- cost sheet import
+# A per-store Google Sheet (supplier order log) gives exact per-order costs. Columns used:
+# 'Ebay Order ID', 'Sourcing Net Cost', 'Shipping Cost', 'Prep Cost', 'Ebay Net Payout', 'Status'.
+SHEET_COLS={'order':'ebay order id','sourcing':'sourcing net cost','shipping':'shipping cost','prep':'prep cost','payout':'ebay net payout','status':'status'}
+
+def sheet_csv_url(url):
+    u=urlparse(url.strip())
+    if u.scheme!='https' or u.netloc!='docs.google.com' or '/spreadsheets/d/' not in u.path:
+        raise ValueError('Use a Google Sheets link (https://docs.google.com/spreadsheets/d/…)')
+    sheet_id=u.path.split('/spreadsheets/d/')[1].split('/')[0]
+    gid=(parse_qs(u.query).get('gid') or parse_qs(u.fragment).get('gid') or ['0'])[0]
+    return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}'
+
+def sheet_money(v):
+    v=(v or '').strip().replace('£','').replace(',','').replace(' ','')
+    if not v or v.startswith('#'):return None
+    try:
+        d=Decimal(v)
+        return d if d.is_finite() else None
+    except InvalidOperation:return None
+
+def parse_cost_sheet(text):
+    """Return [{order, sourcing, shipping, prep, payout, status}] from the sheet CSV.
+    Header names may be split over the first rows (totals row above labels), so search the first 5 rows."""
+    rows=list(csv.reader(io.StringIO(text)))
+    cols={}
+    for r in rows[:5]:
+        for i,name in enumerate(r):
+            n=' '.join(name.lower().split())
+            for key,label in SHEET_COLS.items():
+                if n==label and key not in cols:cols[key]=i
+    if 'order' not in cols or 'sourcing' not in cols:
+        raise ValueError('Sheet needs "Ebay Order ID" and "Sourcing Net Cost" columns')
+    get=lambda r,k:r[cols[k]] if k in cols and cols[k]<len(r) else ''
+    out=[]
+    for r in rows:
+        oid=get(r,'order').strip()
+        if not oid or oid.lower()=='ebay order id':continue
+        out.append({'order':oid,'sourcing':sheet_money(get(r,'sourcing')),'shipping':sheet_money(get(r,'shipping')),'prep':sheet_money(get(r,'prep')),'payout':sheet_money(get(r,'payout')),'status':get(r,'status').strip()})
+    return out
+
+def import_cost_sheet(store_id,text):
+    rows=parse_cost_sheet(text)
+    with db() as c:
+        orders={r['order_id']:dict(r) for r in c.execute('SELECT order_id,proceeds,fees,refunds,status,source_json FROM demo_orders WHERE store_id=?',(store_id,))}
+        c.execute("DELETE FROM demo_costs WHERE store_id=? AND source IN ('sheet','sheet-fee')",(store_id,))
+        rep={'rows':len(rows),'imported':0,'unmatched':[],'cancelled':0,'no_cost':0,'extra_charges':'0.00','payout_higher':0}
+        extra_total=Decimal(0); ts=now()
+        add=lambda oid,sku,kind,amount,note,src='sheet':c.execute("INSERT INTO demo_costs(store_id,order_id,sku,kind,amount,currency,note,created_at,source) VALUES(?,?,?,?,?,'GBP',?,?,?)",(store_id,oid,sku,kind,money(amount),note,ts,src))
+        for r in rows:
+            o=orders.get(r['order'])
+            if not o:rep['unmatched'].append(r['order']);continue
+            if r['status'].lower()=='cancelled':rep['cancelled']+=1;continue
+            if r['sourcing'] is None:rep['no_cost']+=1;continue
+            skus=[l.get('sku') for l in json.loads(o['source_json']).get('lineItems',[])] or [None]
+            # Full sourcing cost on the first line; zero rows mark the other lines' costs as known.
+            for i,sku in enumerate(dict.fromkeys(skus)):add(r['order'],sku,'product',r['sourcing'] if i==0 else 0,'Cost sheet: sourcing')
+            ship=(r['shipping'] or 0)+(r['prep'] or 0)
+            if ship:add(r['order'],skus[0],'fulfilment',ship,'Cost sheet: shipping + prep')
+            # Reconcile to the sheet's net payout: eBay deducts ad fees/labels outside the order's marketplace fee.
+            if r['payout'] is not None and o['proceeds'] not in ('',None):
+                proceeds=Decimal(o['proceeds']);refunds=Decimal(o['refunds'] or '0')
+                if o['fees'] in ('',None):
+                    add(r['order'],None,'other',proceeds-refunds-r['payout'],'Cost sheet: eBay fees (from net payout)','sheet-fee')
+                else:
+                    extra=proceeds-refunds-Decimal(o['fees'])-r['payout']
+                    if extra>Decimal('0.005'):add(r['order'],None,'other',extra,'Cost sheet: other eBay charges (ads/labels)');extra_total+=extra
+                    elif extra<Decimal('-0.005'):rep['payout_higher']+=1
+            rep['imported']+=1
+        rep['extra_charges']=money(extra_total);rep['unmatched']=rep['unmatched'][:20]
+        c.execute('UPDATE demo_stores SET cost_sheet_at=?,cost_sheet_report=? WHERE id=?',(ts,json.dumps(rep),store_id))
+    return rep
+
+def fetch_and_import_sheet(store_id):
+    with db() as c:st=c.execute('SELECT cost_sheet_url FROM demo_stores WHERE id=?',(store_id,)).fetchone()
+    if not st or not st['cost_sheet_url']:return None
+    r=requests.get(sheet_csv_url(st['cost_sheet_url']),timeout=30)
+    if r.status_code!=200 or 'text/csv' not in r.headers.get('content-type',''):
+        raise RuntimeError('Could not read the Google Sheet. Share it as "Anyone with the link can view".')
+    return import_cost_sheet(store_id,r.content.decode('utf-8-sig'))
+
+@app.post('/api/stores/<int:aid>/cost-sheet')
 @manager_required
-def oauth_connect(aid):
-    return jsonify(error='Live eBay OAuth is disabled in the current synthetic demo phase'),501
+def set_cost_sheet(aid):
+    if not allowed_store(current_user(),aid):return jsonify(error='Store not found'),404
+    url=str(request.get_json(force=True).get('url','')).strip()
+    if url:
+        try:sheet_csv_url(url)
+        except ValueError as e:return jsonify(error=str(e)),400
+    with db() as c:c.execute('UPDATE demo_stores SET cost_sheet_url=? WHERE id=?',(url or None,aid))
+    if not url:
+        with db() as c:c.execute("DELETE FROM demo_costs WHERE store_id=? AND source IN ('sheet','sheet-fee')",(aid,))
+        return jsonify(ok=True,removed=True)
+    try:report=fetch_and_import_sheet(aid)
+    except Exception as e:return jsonify(error=str(e)[:300]),502
+    return jsonify(ok=True,report=report)
+
+@app.get('/oauth/connect')
+@manager_required
+def oauth_connect():
+    missing=ebay_config_missing()
+    if missing:return jsonify(error='Set these in .env and restart: '+', '.join(missing)),400
+    session['oauth_state']=secrets.token_urlsafe(24)
+    # prompt=login forces the eBay sign-in screen so a different seller account can be connected each time.
+    q={'client_id':os.getenv('EBAY_CLIENT_ID'),'redirect_uri':os.getenv('EBAY_RUNAME'),'response_type':'code','scope':' '.join(SCOPES),'state':session['oauth_state'],'prompt':'login'}
+    return redirect(oauth_host()+'/oauth2/authorize?'+urlencode(q))
+
+def complete_oauth(code,state):
+    if not code:raise ValueError('eBay did not return an authorization code (consent was declined or the link is incomplete).')
+    if not state or not secrets.compare_digest(state,session.pop('oauth_state','') or '-'):raise ValueError('This sign-in link is stale. Click "Connect eBay store" again.')
+    payload=token_request({'grant_type':'authorization_code','code':code,'redirect_uri':os.getenv('EBAY_RUNAME')})
+    access=payload['access_token']
+    try:
+        who=requests.get(apiz_base()+'/commerce/identity/v1/user/',headers={'Authorization':'Bearer '+access},timeout=30)
+        username=who.json().get('username') if who.ok else None
+    except requests.RequestException:username=None
+    exp=lambda key:(datetime.now(timezone.utc)+timedelta(seconds=int(payload.get(key) or 0))).isoformat()
+    user=current_user()
+    with db() as c:
+        existing=c.execute('SELECT id FROM demo_stores WHERE ebay_user=?',(username,)).fetchone() if username else None
+        values=(encrypt(access),exp('expires_in'),encrypt(payload['refresh_token']),exp('refresh_token_expires_in'))
+        if existing:
+            store_id=existing['id']
+            c.execute('UPDATE demo_stores SET token=?,token_expires=?,refresh_token=?,refresh_expires=?,connected=1,sync_error=NULL WHERE id=?',values+(store_id,))
+        else:
+            n=c.execute("SELECT COUNT(*)+1 FROM demo_stores WHERE source='ebay'").fetchone()[0]
+            name=username or f'eBay store {n}'
+            store_id=c.execute("INSERT INTO demo_stores(name,currency,share,source,marketplace,ebay_user,connected,token,token_expires,refresh_token,refresh_expires) VALUES(?,'GBP','0','ebay',?,?,1,?,?,?,?)",(name[:80],os.getenv('EBAY_MARKETPLACE','EBAY_GB'),username)+values).lastrowid
+            c.execute("INSERT INTO demo_share_history(store_id,percent,loss_sharing,effective_at) VALUES(?,'0',0,'1970-01-01T00:00:00+00:00')",(store_id,))
+        c.execute("INSERT OR IGNORE INTO demo_user_stores(user_id,store_id) SELECT id,? FROM users WHERE role='manager'",(store_id,))
+    try:sync_store(store_id)
+    except Exception:pass  # error is saved on the store and shown in the connections panel
+    return store_id
 
 @app.get('/oauth/callback')
 @manager_required
 def oauth_callback():
-    return jsonify(error='Live eBay OAuth is disabled in the current synthetic demo phase'),501
+    try:complete_oauth(request.args.get('code'),request.args.get('state'))
+    except Exception as e:return render_template('oauth_result.html',ok=False,message=str(e)),400
+    return redirect('/')
+
+@app.post('/api/oauth/complete')
+@manager_required
+def oauth_complete_pasted():
+    """Fallback when the RuName's accepted URL can't reach this local app: paste the address eBay redirected to."""
+    raw=str(request.get_json(force=True).get('url','')).strip()
+    q=parse_qs(urlparse(raw).query) if '?' in raw else parse_qs(raw)
+    try:complete_oauth((q.get('code') or [None])[0],(q.get('state') or [None])[0])
+    except Exception as e:return jsonify(error=str(e)),400
+    return jsonify(ok=True)
 
 @app.post('/api/disconnect/<int:aid>')
 @manager_required
 def disconnect(aid):
-    return jsonify(error='Live eBay account management is disabled in the current synthetic demo phase'),501
+    if not allowed_store(current_user(),aid):return jsonify(error='Store not found'),404
+    with db() as c:c.execute("UPDATE demo_stores SET connected=0,token=NULL,token_expires=NULL,refresh_token=NULL WHERE id=? AND source='ebay'",(aid,))
+    return jsonify(ok=True)
 
 @app.post('/api/sync/<int:aid>')
 @manager_required
 def sync(aid):
-    return jsonify(error='Live eBay sync is disabled in the current synthetic demo phase'),501
-    # Retained below for the future live-data phase; demo routes never call it.
-    try:
-        with db() as c:a=c.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
-        if not a: return jsonify(error='Account not found'),404
-        token_for(aid)
-        cursor=a['cursor'] or (datetime.now(timezone.utc)-timedelta(days=90)).isoformat(timespec='milliseconds').replace('+00:00','Z')
-        offset=0;total=0;currency_set=set()
-        while True:
-            payload=ebay_get(aid,'/sell/fulfillment/v1/order',{'filter':f'lastmodifieddate:[{cursor}..]','limit':200,'offset':offset,'fieldGroups':'TAX_BREAKDOWN'})
-            orders=payload.get('orders',[])
-            with db() as c:
-                for o in orders:
-                    summary=o.get('pricingSummary',{}); curr=(summary.get('total') or summary.get('priceSubtotal') or {}).get('currency')
-                    currency_set.add(curr)
-                    item_sales=summary.get('priceSubtotal')
-                    delivery=summary.get('deliveryCost') or {};discount=summary.get('deliveryDiscount') or {}
-                    proceeds_value=(Decimal(item_sales['value'])+Decimal(delivery.get('value','0'))+Decimal(discount.get('value','0'))) if item_sales and item_sales.get('value') is not None else None
-                    tax=summary.get('tax')
-                    if tax is None:
-                        marketplace_taxes=[t.get('amount',{}) for line in o.get('lineItems',[]) for t in line.get('ebayCollectAndRemitTaxes',[])]
-                        tax_value=sum((Decimal(t['value']) for t in marketplace_taxes if t.get('value') is not None),Decimal(0)) if marketplace_taxes else None
-                    else: tax_value=Decimal(tax.get('value','0'))
-                    c.execute('''INSERT INTO orders(account_id,order_id,created_at,modified_at,currency,proceeds,tax,source_json,status) VALUES(?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(account_id,order_id) DO UPDATE SET modified_at=excluded.modified_at,currency=excluded.currency,proceeds=excluded.proceeds,tax=excluded.tax,source_json=excluded.source_json,status=excluded.status''',(aid,o['orderId'],o.get('creationDate'),o.get('lastModifiedDate'),curr,money(proceeds_value) if proceeds_value is not None else None,money(tax_value) if tax_value is not None else None,json.dumps(o),o.get('orderPaymentStatus')))
-                total+=len(orders)
-            if len(orders)<200:break
-            offset+=200
-        results={'orders':total,'finances':'unavailable','inventory':'unavailable','analytics':'unavailable'};errors=[]
-        if a['marketplace'] in ('EBAY_GB','EBAY_DE','EBAY_FR','EBAY_IT','EBAY_ES'):
-            errors.append('Finances skipped: EU/UK-domiciled sellers require eBay digital-signature headers and registered signing keys.')
-        else:
-            try:
-                # Transactions remain in a separate account ledger; payouts never become order proceeds.
-                start=datetime.now(timezone.utc)-timedelta(days=90);end=datetime.now(timezone.utc)
-                offset=0;rows=0
-                while True:
-                    tx=ebay_get(aid,'/sell/finances/v1/transaction',{'filter':f'transactionDate:[{start:%Y-%m-%dT%H:%M:%S.000Z}..{end:%Y-%m-%dT%H:%M:%S.000Z}]','limit':1000,'offset':offset})
-                    items=tx.get('transactions',[])
-                    with db() as c:
-                        for t in items:
-                            am=t.get('amount',{});c.execute('INSERT INTO ledger(account_id,transaction_id,order_id,type,amount,currency,source_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id,transaction_id) DO UPDATE SET order_id=excluded.order_id,type=excluded.type,amount=excluded.amount,currency=excluded.currency,source_json=excluded.source_json',(aid,t['transactionId'],t.get('orderId'),t.get('transactionType'),money(am.get('value')),am.get('currency'),json.dumps(t)))
-                    rows+=len(items)
-                    if len(items)<1000:break
-                    offset+=1000
-                results['finances']=rows
-            except Exception as ex:errors.append('Finances sync unavailable: '+str(ex)[:180])
-        try:results['inventory']=sync_inventory(aid,a['marketplace'])
-        except Exception as ex:errors.append('Inventory sync unavailable: '+str(ex)[:180])
-        try:results['analytics']=sync_analytics(aid,a['marketplace'])
-        except Exception as ex:errors.append('Analytics sync unavailable: '+str(ex)[:180])
-        coverage={'orders':True,'finances':results['finances']!='unavailable','inventory':results['inventory']!='unavailable','analytics':results['analytics']!='unavailable','currencies':sorted(x for x in currency_set if x),'gaps':errors}
-        with db() as c:c.execute('UPDATE accounts SET sync_at=?,cursor=?,coverage=?,error=? WHERE id=?',(now(),datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z'),json.dumps(coverage),'; '.join(errors) or None,aid))
-        return jsonify(ok=True,results=results,coverage=coverage)
-    except Exception as e:
-        message=f'{type(e).__name__}: {e}'[:500]
-        with db() as c:c.execute('UPDATE accounts SET error=? WHERE id=?',(message,aid))
-        return jsonify(error=message),502
+    if not allowed_store(current_user(),aid):return jsonify(error='Store not found'),404
+    try:count=sync_store(aid)
+    except Exception as e:return jsonify(error=str(e)[:400]),502
+    return jsonify(ok=True,orders=count)
 
 @app.get('/health')
 def health():return jsonify(status='ok')
 
-if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.getenv('PORT','5000')),debug=False)
+if __name__=='__main__':
+    start_auto_sync()
+    app.run(host='127.0.0.1',port=int(os.getenv('PORT','5000')),debug=False)
