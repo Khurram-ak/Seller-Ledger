@@ -10,3 +10,5 @@
 .bd-note{margin:0 0 12px;padding:10px 12px;border-radius:10px;background:#fff6e5;border:1px solid #f0d9a8;font-size:13px}
 .estimated{color:#8a5a00;background:#fff3d6;padding:2px 8px;border-radius:99px;font-size:12px;font-weight:600}
 .bd-est{background:#eef4ff;border-color:#c9d8f5}
+/* TEMP demo: hide profit-share figures */
+.hide-share .share-col{display:none!important}

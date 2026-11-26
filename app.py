@@ -201,6 +201,16 @@ def home():
     session.setdefault('csrf',secrets.token_urlsafe(32))
     return render_template('index.html')
 
+LOGIN_FAILS={};LOGIN_WINDOW=900;LOGIN_MAX=5
+def client_ip():
+    # Behind Cloudflare Tunnel every request arrives from localhost; trust its header only then.
+    if request.remote_addr in ('127.0.0.1','::1') and request.headers.get('CF-Connecting-IP'):return request.headers['CF-Connecting-IP']
+    return request.remote_addr or '?'
+def too_many_failures(key):
+    cutoff=time.time()-LOGIN_WINDOW;LOGIN_FAILS[key]=[t for t in LOGIN_FAILS.get(key,[]) if t>cutoff]
+    return len(LOGIN_FAILS[key])>=LOGIN_MAX
+def record_failure(key):LOGIN_FAILS.setdefault(key,[]).append(time.time())
+
 @app.route('/login',methods=['GET','POST'])
 def login():
     if current_user():
@@ -210,6 +220,10 @@ def login():
     if request.method=='POST':
         username=request.form.get('username','').strip()
         password=request.form.get('password','')
+        keys=(('ip',client_ip()),('user',username.lower()))
+        if any(too_many_failures(k) for k in keys):
+            error='Too many failed sign-ins. Wait 15 minutes and try again.'
+            return render_template('login.html',csrf=session['csrf'],configured=True,error=error),429
         with db() as c:
             row=c.execute('SELECT * FROM users WHERE username=? AND active=1',(username,)).fetchone()
         if row and check_password_hash(row['password_hash'],password):
@@ -218,6 +232,7 @@ def login():
             session['csrf']=secrets.token_urlsafe(32)
             session.permanent=True
             return redirect(url_for('home'))
+        for k in keys:record_failure(k)
         error='Username or password is incorrect.'
     with db() as c:
         configured=c.execute('SELECT COUNT(*) FROM users WHERE active=1').fetchone()[0]>0
