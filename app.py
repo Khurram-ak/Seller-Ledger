@@ -20,8 +20,13 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv('DATABASE_PATH', os.path.join(ROOT, 'dashboard.sqlite3'))
+if os.path.dirname(DB_PATH):os.makedirs(os.path.dirname(DB_PATH),exist_ok=True)
 app = Flask(__name__)
 app.secret_key = os.getenv('APP_SECRET') or secrets.token_urlsafe(48)
+if os.getenv('TRUST_PROXY')=='1':
+    # Behind a hosting proxy (e.g. Render): take the client IP and https scheme from its headers.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE', '0') == '1', PERMANENT_SESSION_LIFETIME=timedelta(hours=12), MAX_CONTENT_LENGTH=8 * 1024 * 1024)
 CENT = Decimal('0.01')
 SCOPES = [
@@ -897,6 +902,9 @@ def sync(aid):
 @app.get('/health')
 def health():return jsonify(status='ok')
 
+# Under gunicorn (hosted), start the background sync at import. Run a single worker so only one sync loop exists.
+if os.getenv('AUTO_SYNC_ON_START')=='1':start_auto_sync()
+
 if __name__=='__main__':
-    start_auto_sync()
+    if os.getenv('AUTO_SYNC_ON_START')!='1':start_auto_sync()
     app.run(host='127.0.0.1',port=int(os.getenv('PORT','5000')),debug=False)

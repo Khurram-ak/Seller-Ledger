@@ -1,0 +1,45 @@
+# Render Blueprint: New > Blueprint, pick this repo. Secrets marked sync:false are entered in the Render dashboard.
+services:
+  - type: web
+    name: seller-ledger
+    runtime: python
+    plan: starter            # a persistent disk needs a paid instance; the free plan wipes the database
+    buildCommand: pip install -r requirements.txt
+    # One worker so only one background eBay sync loop runs; threads handle concurrent visitors.
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /login
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.2
+      - key: DATABASE_PATH
+        value: /var/data/dashboard.sqlite3
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: AUTO_SYNC_ON_START
+        value: "1"
+      - key: EBAY_ENV
+        value: production
+      - key: EBAY_MARKETPLACE
+        value: EBAY_GB
+      - key: EBAY_AUTO_SYNC_MINUTES
+        value: "30"
+      - key: EBAY_SYNC_DAYS
+        value: "90"
+      - key: APP_SECRET
+        generateValue: true
+      - {key: EBAY_CLIENT_ID, sync: false}
+      - {key: EBAY_CLIENT_SECRET, sync: false}
+      - {key: EBAY_RUNAME, sync: false}
+      - {key: TOKEN_ENCRYPTION_KEY, sync: false}
+      - {key: DEMO_MANAGER_USERNAME, sync: false}
+      - {key: DEMO_MANAGER_PASSWORD, sync: false}
+      - {key: DEMO_CLIENT_PASSWORD, sync: false}
+      - {key: DEMO_PARTNER_USERNAME, sync: false}
+      - {key: DEMO_PARTNER_NAME, sync: false}
+      - {key: DEMO_PARTNER_PASSWORD, sync: false}
