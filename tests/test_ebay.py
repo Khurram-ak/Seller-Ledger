@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -36,7 +37,8 @@ class EbayTests(unittest.TestCase):
         self.old_path = app.DB_PATH
         app.DB_PATH = os.path.join(self.tmp.name, 'test.sqlite')
         self.env = mock.patch.dict(os.environ, {'EBAY_CLIENT_ID': 'id', 'EBAY_CLIENT_SECRET': 'secret', 'EBAY_RUNAME': 'ru-name', 'TOKEN_ENCRYPTION_KEY': Fernet.generate_key().decode(),
-                                               'DEMO_MANAGER_USERNAME': 'manager@test.local', 'DEMO_CLIENT_USERNAME': 'client@test.local', 'DEMO_MANAGER_PASSWORD': 'manager-test-password', 'DEMO_CLIENT_PASSWORD': 'client-test-password'})
+                                               'DEMO_MANAGER_USERNAME': 'manager@test.local', 'DEMO_CLIENT_USERNAME': 'client@test.local', 'DEMO_MANAGER_PASSWORD': 'manager-test-password', 'DEMO_CLIENT_PASSWORD': 'client-test-password',
+                                               'DEMO_PARTNER_USERNAME': 'partner@test.local', 'DEMO_PARTNER_PASSWORD': 'partner-test-password'})
         self.env.start()
         app.init_db(); app.seed_demo_data(); app.seed_demo_users()
         self.orders = [ebay_order('O-1'), ebay_order('O-2', fee=None, refund='5.00'), ebay_order('O-3', cancelled=True)]
@@ -77,6 +79,34 @@ class EbayTests(unittest.TestCase):
             state = s['oauth_state']
         with mock.patch('app.requests.post', self.fake_post), mock.patch('app.requests.get', self.fake_get):
             return self.client.post('/api/oauth/complete', json={'url': f'https://localhost:5050/oauth/callback?state={state}&code=v%5E1.1%23abc'}, headers={'X-CSRF-Token': csrf})
+
+    def test_partner_sees_everything_except_share(self):
+        csrf = self.login('manager@test.local', 'manager-test-password')
+        self.connect(csrf)
+        with mock.patch('app.requests.get', self.fake_get):
+            store_id = self.client.get('/api/state').get_json()['stores'][0]['id']
+        with app.db() as c:
+            c.execute("UPDATE demo_stores SET share='30' WHERE id=?", (store_id,))
+        mgr = self.client.get('/api/state').get_json()
+        self.assertIn('share', mgr['stores'][0])
+        self.assertIn('my_share', mgr['orders'][0]['calculation'])
+        self.assertIn('my_share', self.client.get('/api/export/profit.csv').get_data(as_text=True))
+        pcsrf = self.login('partner@test.local', 'partner-test-password')
+        p = self.client.get('/api/state').get_json()
+        self.assertEqual(p['user']['role'], 'manager')
+        self.assertTrue(p['user']['hide_share'])
+        self.assertEqual([s['id'] for s in p['stores']], [s['id'] for s in mgr['stores']])
+        self.assertEqual(len(p['orders']), len(mgr['orders']))
+        body = json.dumps(p)
+        for word in ('my_share', '"share"', 'loss_sharing'):
+            self.assertNotIn(word, body)
+        self.assertNotIn('share', self.client.get('/api/export/profit.csv').get_data(as_text=True).splitlines()[0])
+        # Partner can edit store settings but cannot change the share.
+        r = self.client.post(f'/api/stores/{store_id}', json={'name': 'Renamed', 'share': '99', 'loss_sharing': '1', 'fulfilment_mode': 'dropshipping', 'low_stock_threshold': 3}, headers={'X-CSRF-Token': pcsrf})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        with app.db() as c:
+            row = c.execute('SELECT name,share,loss_sharing FROM demo_stores WHERE id=?', (store_id,)).fetchone()
+        self.assertEqual((row['name'], row['share'], row['loss_sharing']), ('Renamed', '30', 0))
 
     def test_map_order_fields(self):
         m = app.map_order(ebay_order('X', refund='5.00'))

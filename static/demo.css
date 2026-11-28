@@ -10,5 +10,53 @@
 .bd-note{margin:0 0 12px;padding:10px 12px;border-radius:10px;background:#fff6e5;border:1px solid #f0d9a8;font-size:13px}
 .estimated{color:#8a5a00;background:#fff3d6;padding:2px 8px;border-radius:99px;font-size:12px;font-weight:600}
 .bd-est{background:#eef4ff;border-color:#c9d8f5}
-/* TEMP demo: hide profit-share figures */
+/* Users with hide_share never see profit-share figures */
 .hide-share .share-col{display:none!important}
+/* Recent orders: scroll inside the panel instead of stretching the page; header stays visible */
+.table-wrap:has(#orders){max-height:560px;overflow:auto}
+.table-wrap:has(#orders) thead th{position:sticky;top:0;z-index:1;background:#fff;box-shadow:0 1px 0 #e3e8e5}
+/* ---------- Mobile ---------- */
+@media(max-width:850px){
+  .topbar{gap:10px}
+  .lst-summary div:last-child:nth-child(odd){grid-column:span 2}
+  .compare-row{grid-template-columns:1fr;gap:10px}
+  .ebay-actions{flex-wrap:wrap}
+  .sheet-form{flex-wrap:wrap}.sheet-form input{flex:1 1 100%}
+  .panel-title{flex-wrap:wrap}
+}
+@media(max-width:640px){
+  /* 16px stops iOS zooming into inputs */
+  input,select,.button,.primary{font-size:16px}
+  .shell{padding:10px}
+  .brand small{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .role-badge{display:none}
+  .top-actions .button{padding:8px 10px;font-size:13px}
+  .intro{padding:18px 0 12px}
+  .filters label{min-width:0}
+  .stat-grid{gap:8px}.stat{padding:12px}.stat strong{font-size:19px;margin:8px 0 5px}
+  .panel{padding:14px;border-radius:13px}
+  .table-tools{flex-wrap:wrap}.table-tools>*{flex:1 1 140px}
+  .table-tools .button{justify-content:center}
+  .inline-form label{min-width:0;flex:1 1 100%}.inline-form .primary{width:100%}
+  .lst-summary{gap:8px}.lst-summary b{font-size:17px}
+  .legend{flex-wrap:wrap}
+  .item-costs-actions{flex-wrap:wrap}
+  /* Tables become cards: one card per row, each cell labelled from its column header */
+  table.cardable,table.cardable tbody,table.cardable tr,table.cardable td{display:block;width:100%}
+  table.cardable thead{display:none}
+  table.cardable{white-space:normal;font-size:13px}
+  table.cardable tr{border:1px solid #e4ebe8;border-radius:12px;padding:6px 12px;margin-bottom:10px;background:#fff}
+  table.cardable td{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:7px 0;border-top:1px solid #f0f3f2;text-align:right;min-width:0;max-width:none}
+  table.cardable td:first-child{border-top:0}
+  table.cardable td::before{content:attr(data-label);color:#73837e;font-size:11px;font-weight:600;text-align:left;flex:none;max-width:45%}
+  table.cardable td:not([data-label])::before,table.cardable td[data-label=""]::before{display:none}
+  /* Item / listing title cells span the full card width as its heading */
+  table.cardable td.item-cell,table.cardable td.lst-item{display:flex;justify-content:flex-start;text-align:left;padding-top:4px}
+  table.cardable td.item-cell::before,table.cardable td.lst-item::before{display:none}
+  table.cardable td.item-cell b{font-size:14px}
+  .lst-item{min-width:0}
+  .lst-tags{min-width:0;justify-content:flex-end;flex-wrap:wrap}
+  .item-costs-wrap td input{width:120px}
+  .table-wrap:has(#orders),.lst-wrap,.item-costs-wrap{max-height:70vh}
+  .ins-alerts{max-height:none}
+}
