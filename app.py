@@ -76,6 +76,9 @@ def init_db():
         if not c.execute('SELECT 1 FROM schema_migrations WHERE version=8').fetchone():
             with open(os.path.join(ROOT,'migrations','008_listings.sql'),encoding='utf-8') as f:c.executescript(f.read())
             c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)',(now(),))
+        if not c.execute('SELECT 1 FROM schema_migrations WHERE version=9').fetchone():
+            with open(os.path.join(ROOT,'migrations','009_hide_share.sql'),encoding='utf-8') as f:c.executescript(f.read())
+            c.execute('INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)',(now(),))
         # Seed a fresh database once. Never recreate defaults when an owner has
         # renamed or removed their accounts.
         if c.execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 0:
@@ -121,9 +124,12 @@ def seed_demo_users():
         stores=[r['id'] for r in c.execute("SELECT id FROM demo_stores WHERE source='demo' ORDER BY id")]
         if len(stores)<4:
             raise RuntimeError('Demo stores are not initialized')
-        credentials=[(os.getenv('DEMO_MANAGER_USERNAME','manager@demo.local'),'Demo Manager','manager',manager_password,stores),(os.getenv('DEMO_CLIENT_USERNAME','client@demo.local'),'Demo Client','client',client_password,[stores[0]])]
-        for username,display,role,password,assigned in credentials:
-            c.execute('INSERT INTO users(username,display_name,password_hash,role,active,created_at) VALUES(?,?,?,?,1,?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name,password_hash=excluded.password_hash,role=excluded.role,active=1',(username,display,generate_password_hash(password,method='scrypt'),role,now()))
+        credentials=[(os.getenv('DEMO_MANAGER_USERNAME','manager@demo.local'),'Demo Manager','manager',manager_password,stores,0),(os.getenv('DEMO_CLIENT_USERNAME','client@demo.local'),'Demo Client','client',client_password,[stores[0]],0)]
+        # Optional partner: full manager access, but never sees profit-share figures.
+        partner_password=os.getenv('DEMO_PARTNER_PASSWORD','')
+        if len(partner_password)>=12:credentials.append((os.getenv('DEMO_PARTNER_USERNAME','partner@demo.local'),os.getenv('DEMO_PARTNER_NAME','Partner'),'manager',partner_password,stores,1))
+        for username,display,role,password,assigned,hide_share in credentials:
+            c.execute('INSERT INTO users(username,display_name,password_hash,role,active,created_at,hide_share) VALUES(?,?,?,?,1,?,?) ON CONFLICT(username) DO UPDATE SET display_name=excluded.display_name,password_hash=excluded.password_hash,role=excluded.role,active=1,hide_share=excluded.hide_share',(username,display,generate_password_hash(password,method='scrypt'),role,now(),hide_share))
             user_id=c.execute('SELECT id FROM users WHERE username=?',(username,)).fetchone()['id']
             # Only reset synthetic-store assignments; live eBay store access is managed in the app and must survive restarts.
             c.execute("DELETE FROM demo_user_stores WHERE user_id=? AND store_id IN (SELECT id FROM demo_stores WHERE source='demo')",(user_id,))
@@ -137,7 +143,7 @@ def current_user():
     if not user_id:
         return None
     with db() as c:
-        row=c.execute('SELECT id,username,display_name,role,active FROM users WHERE id=?',(user_id,)).fetchone()
+        row=c.execute('SELECT id,username,display_name,role,active,hide_share FROM users WHERE id=?',(user_id,)).fetchone()
     if not row or not row['active']:
         session.clear()
         return None
@@ -285,7 +291,7 @@ def sheet_estimates(orders,costs):
 
 def build_demo_state(user):
     ids=visible_store_ids(user['id']); live=live_mode()
-    base={'user':{'name':user['display_name'],'role':user['role']},'dataset':'LIVE EBAY' if live else 'SYNTHETIC DEMO','live':live,'csrf':session.get('csrf')}
+    base={'user':{'name':user['display_name'],'role':user['role'],'hide_share':bool(user.get('hide_share'))},'dataset':'LIVE EBAY' if live else 'SYNTHETIC DEMO','live':live,'csrf':session.get('csrf')}
     if user['role']=='manager':base['ebay']=ebay_status()
     if not ids:
         if user['role']=='manager':base['clients']=client_access([])
@@ -321,6 +327,10 @@ def build_demo_state(user):
         listings=[dict(r) for r in c.execute(f'''SELECT l.store_id AS account_id,l.item_id,l.title,l.price,l.currency,l.quantity,l.quantity_available,l.quantity_sold,l.watch_count,l.has_variations,l.start_time,l.view_url,l.image_url,l.status,
             t.days AS traffic_days,t.impressions,t.views,t.transactions,t.ctr,t.conversion FROM demo_listings l LEFT JOIN demo_listing_traffic t ON t.store_id=l.store_id AND t.item_id=l.item_id WHERE l.store_id IN ({marks})''',ids)]
     out={**base,'stores':stores,'orders':orders,'costs':costs,'defaults':defaults,'history':[],'listings':listings}
+    if user.get('hide_share'):
+        # Removed server-side, not just hidden in the page, so the figures never reach this user's browser.
+        for s in stores:s.pop('share',None);s.pop('loss_sharing',None)
+        for o in orders:o['calculation'].pop('share',None);o['calculation'].pop('my_share',None)
     if user['role']=='manager':out['clients']=client_access(ids)
     return out
 
@@ -371,6 +381,11 @@ def edit_account(aid):
     if not name or len(name)>80:return jsonify(error='Store name must be 1 to 80 characters'),400
     mode=d.get('fulfilment_mode','dropshipping')
     loss_sharing=1 if str(d.get('loss_sharing','0')) in ('1','true','True') else 0
+    if user.get('hide_share'):
+        # This user can't see or change the profit share: keep the current values.
+        with db() as c:cur=c.execute('SELECT share,loss_sharing FROM demo_stores WHERE id=?',(aid,)).fetchone()
+        d={**d,'share':cur['share'],'loss_sharing':cur['loss_sharing']}
+        loss_sharing=cur['loss_sharing']
     try:
         threshold=int(d.get('low_stock_threshold',3)); share=Decimal(str(d.get('share','0')))
         effective_date=datetime.fromisoformat(str(d.get('effective_date') or datetime.now(timezone.utc).date().isoformat())).date()
@@ -379,7 +394,7 @@ def edit_account(aid):
     effective_at=effective_date.isoformat()+'T00:00:00+00:00'
     with db() as c:
         c.execute('UPDATE demo_stores SET name=?,fulfilment_mode=?,low_stock_threshold=?,share=?,loss_sharing=? WHERE id=?',(name,mode,threshold,str(share),loss_sharing,aid))
-        c.execute('INSERT INTO demo_share_history(store_id,percent,loss_sharing,effective_at) VALUES(?,?,?,?) ON CONFLICT(store_id,effective_at) DO UPDATE SET percent=excluded.percent,loss_sharing=excluded.loss_sharing',(aid,str(share),loss_sharing,effective_at))
+        if not user.get('hide_share'):c.execute('INSERT INTO demo_share_history(store_id,percent,loss_sharing,effective_at) VALUES(?,?,?,?) ON CONFLICT(store_id,effective_at) DO UPDATE SET percent=excluded.percent,loss_sharing=excluded.loss_sharing',(aid,str(share),loss_sharing,effective_at))
     return jsonify(ok=True)
 
 @app.post('/api/costs')
@@ -457,10 +472,11 @@ def export(kind):
     try:orders=filter_export_orders(state_data['orders'],allowed)
     except ValueError:return jsonify(error='Invalid or reversed date range'),400
     out=io.StringIO(); w=csv.writer(out)
-    w.writerow(['store','order_id','created_at','currency','sales','marketplace_tax','refunds','fees','known_costs','estimated_profit','share_percent','my_share','missing_costs'])
+    hide=bool(user.get('hide_share'))
+    w.writerow(['store','order_id','created_at','currency','sales','marketplace_tax','refunds','fees','known_costs','estimated_profit']+([] if hide else ['share_percent','my_share'])+['missing_costs'])
     for o in orders:
         calc=o['calculation']
-        w.writerow([calc['account'],o['order_id'],o['created_at'],o['currency'],o['proceeds'],o['tax'],o['refunds'],o['fees'],money(Decimal(calc['product'])+Decimal(calc['fulfilment'])+Decimal(calc['other'])),calc['profit'],calc['share'],calc['my_share'],calc['missing']])
+        w.writerow([calc['account'],o['order_id'],o['created_at'],o['currency'],o['proceeds'],o['tax'],o['refunds'],o['fees'],money(Decimal(calc['product'])+Decimal(calc['fulfilment'])+Decimal(calc['other'])),calc['profit']]+([] if hide else [calc['share'],calc['my_share']])+[calc['missing']])
     return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename="{kind}.csv"'})
 
 def filter_export_orders(orders,allowed_ids):
